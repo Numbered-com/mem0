@@ -89,7 +89,11 @@ DEFAULT_CONFIG = {
         "config": {
             "api_key": GOOGLE_API_KEY,
             "model": "gemini-2.0-flash",
-            "temperature": 0.2
+            "temperature": 0.2,
+            # "model": "gemini-2.5-flash-preview-04-17",
+            # "thinking_config": {
+            #     "thinking_budget ": 0,
+            # },
         }
     },
     # "embedder": {

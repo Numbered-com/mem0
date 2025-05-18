@@ -433,15 +433,50 @@ class Memory(MemoryBase):
         return returned_memories
 
     def _add_to_graph(self, messages, filters):
-        added_entities = []
+        all_added_entities = []
         if self.enable_graph:
-            if filters.get("user_id") is None:
-                filters["user_id"] = "user"
+            # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
+            base_user_id = filters.get("user_id")
+            if not base_user_id:
+                # Fallback if no user_id was in the initial filters. This should ideally be set earlier.
+                base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
+                filters["user_id"] = base_user_id # Ensure it's in filters for graph methods that expect it
 
-            data = "\n".join([msg["content"] for msg in messages if "content" in msg and msg["role"] != "system"])
-            added_entities = self.graph.add(data, filters)
+            for message_dict in messages:
+                if not isinstance(message_dict, dict) or \
+                   message_dict.get("role") == "system" or \
+                   message_dict.get("content") is None:
+                    continue
 
-        return added_entities
+                msg_content = message_dict["content"]
+
+                # Determine actor_id for this message
+                actor_name = message_dict.get("name")
+                current_actor_id = actor_name if actor_name else base_user_id # Use message's 'name' or fallback
+
+                # Create a specific filter set for this message, including the actor_id
+                message_filters = filters.copy() # Start with a copy of the general filters
+                message_filters["actor_id"] = current_actor_id
+                # Ensure user_id is still present, as graph.add might rely on it at a higher level
+                if "user_id" not in message_filters:
+                    message_filters["user_id"] = base_user_id
+
+                logging.debug(f"Adding to graph for actor_id: {current_actor_id}, user_id: {message_filters['user_id']}, content: '{msg_content[:50]}...'")
+                try:
+                    added_entities_for_message = self.graph.add(msg_content, message_filters)
+                    if added_entities_for_message: # graph.add might return None or an empty structure
+                        if isinstance(added_entities_for_message, list):
+                            all_added_entities.extend(added_entities_for_message)
+                        elif isinstance(added_entities_for_message, dict) and "added_entities" in added_entities_for_message:
+                            # Assuming the structure is {"deleted_entities": [...], "added_entities": [...]}
+                            if added_entities_for_message["added_entities"]:
+                                all_added_entities.extend(added_entities_for_message["added_entities"])
+                        # Add more robust handling if the return type of self.graph.add varies more
+                except Exception as e:
+                    logger.error(f"Error adding message to graph for actor {current_actor_id}: {e}")
+                    # Optionally, decide if you want to continue with other messages or raise
+
+        return all_added_entities
 
     def get(self, memory_id):
         """
@@ -1261,15 +1296,50 @@ class AsyncMemory(MemoryBase):
         return returned_memories
 
     async def _add_to_graph(self, messages, filters):
-        added_entities = []
+        all_added_entities = []
         if self.enable_graph:
-            if filters.get("user_id") is None:
-                filters["user_id"] = "user"
+            # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
+            base_user_id = filters.get("user_id")
+            if not base_user_id:
+                # Fallback if no user_id was in the initial filters. This should ideally be set earlier.
+                base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
+                filters["user_id"] = base_user_id # Ensure it's in filters for graph methods that expect it
 
-            data = "\n".join([msg["content"] for msg in messages if "content" in msg and msg["role"] != "system"])
-            added_entities = await asyncio.to_thread(self.graph.add, data, filters)
+            for message_dict in messages:
+                if not isinstance(message_dict, dict) or \
+                   message_dict.get("role") == "system" or \
+                   message_dict.get("content") is None:
+                    continue
 
-        return added_entities
+                msg_content = message_dict["content"]
+
+                # Determine actor_id for this message
+                actor_name = message_dict.get("name")
+                current_actor_id = actor_name if actor_name else base_user_id # Use message's 'name' or fallback
+
+                # Create a specific filter set for this message, including the actor_id
+                message_filters = filters.copy() # Start with a copy of the general filters
+                message_filters["actor_id"] = current_actor_id
+                # Ensure user_id is still present, as graph.add might rely on it at a higher level
+                if "user_id" not in message_filters:
+                    message_filters["user_id"] = base_user_id
+
+                logging.debug(f"Adding to graph for actor_id: {current_actor_id}, user_id: {message_filters['user_id']}, content: '{msg_content[:50]}...'")
+                try:
+                    added_entities_for_message = self.graph.add(msg_content, message_filters)
+                    if added_entities_for_message: # graph.add might return None or an empty structure
+                        if isinstance(added_entities_for_message, list):
+                            all_added_entities.extend(added_entities_for_message)
+                        elif isinstance(added_entities_for_message, dict) and "added_entities" in added_entities_for_message:
+                            # Assuming the structure is {"deleted_entities": [...], "added_entities": [...]}
+                            if added_entities_for_message["added_entities"]:
+                                all_added_entities.extend(added_entities_for_message["added_entities"])
+                        # Add more robust handling if the return type of self.graph.add varies more
+                except Exception as e:
+                    logger.error(f"Error adding message to graph for actor {current_actor_id}: {e}")
+                    # Optionally, decide if you want to continue with other messages or raise
+
+        return all_added_entities
 
     async def get(self, memory_id):
         """

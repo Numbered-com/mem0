@@ -50,7 +50,7 @@ Entity Consistency:
     - Ensure that relationships are coherent and logically align with the context of the message.
     - Maintain consistent naming for entities across the extracted data.
 
-Strive to construct a coherent and easily understandable knowledge graph by eshtablishing all the relationships among the entities and adherence to the user’s context.
+Strive to construct a coherent and easily understandable knowledge graph by eshtablishing all the relationships among the entities and adherence to the user's context.
 
 Adhere strictly to these guidelines to ensure high-quality knowledge graph extraction."""
 
@@ -59,7 +59,7 @@ You are a graph memory manager specializing in identifying, managing, and optimi
 Input:
 1. Existing Graph Memories: A list of current graph memories, each containing source, relationship, and destination information.
 2. New Text: The new information to be integrated into the existing graph structure.
-3. Use "USER_ID" as node for any self-references (e.g., "I," "me," "my," etc.) in user messages.
+3. Use "SELF_REFERENCE_ID" as node for any self-references (e.g., "I," "me," "my," etc.) in user messages.
 
 Guidelines:
 1. Identification: Use the new information to evaluate existing relationships in the memory graph.
@@ -76,9 +76,9 @@ Guidelines:
 6. Temporal Awareness: Prioritize recency when timestamps are available.
 7. Necessity Principle: Only DELETE relationships that must be deleted and are contradictory/outdated to the new information to maintain an accurate and coherent memory graph.
 
-Note: DO NOT DELETE if their is a possibility of same type of relationship but different destination nodes. 
+Note: DO NOT DELETE if their is a possibility of same type of relationship but different destination nodes.
 
-For example: 
+For example:
 Existing Memory: alice -- loves_to_eat -- pizza
 New Information: Alice also loves to eat burger.
 
@@ -87,11 +87,14 @@ Do not delete in the above example because there is a possibility that Alice lov
 Memory Format:
 source -- relationship -- destination
 
-Provide a list of deletion instructions, each specifying the relationship to be deleted.
+Provide a list of deletion instructions.
+For each relationship you identify as needing deletion according to the guidelines, you MUST make one call to the `delete_graph_memory` tool.
+If multiple relationships need to be deleted, you MUST make multiple, separate calls to the `delete_graph_memory` tool (one call per relationship).
+Provide the `source`, `relationship`, and `destination` for each deletion using this tool.
 """
 
 
-def get_delete_messages(existing_memories_string, data, user_id):
+def get_delete_messages(existing_memories_string, data, self_reference_id):
     return DELETE_RELATIONS_SYSTEM_PROMPT.replace(
-        "USER_ID", user_id
+        "SELF_REFERENCE_ID", self_reference_id
     ), f"Here are the existing memories: {existing_memories_string} \n\n New Information: {data}"

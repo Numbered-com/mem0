@@ -58,16 +58,33 @@ class MemoryGraph:
         Args:
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
+                            Expected to contain 'user_id' and 'actor_id'.
         """
-        entity_type_map = self._retrieve_nodes_from_data(data, filters)
-        to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
-        to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
+        # Ensure required filter keys are present, or provide defaults.
+        if "user_id" not in filters:
+            filters["user_id"] = filters.get("agent_id") or filters.get("run_id") or "default_user"
+            logger.warning(f"MemoryGraph.add: 'user_id' was missing in filters, defaulted to {filters['user_id']}")
 
-        # TODO: Batch queries with APOC plugin
-        # TODO: Add more filter support
-        deleted_entities = self._delete_entities(to_be_deleted, filters["user_id"])
-        added_entities = self._add_entities(to_be_added, filters["user_id"], entity_type_map)
+        if "actor_id" not in filters:
+            filters["actor_id"] = filters["user_id"] # Default actor_id to user_id if not present
+            logger.info(f"MemoryGraph.add: 'actor_id' was missing in filters, defaulted to user_id: {filters['actor_id']}")
+        else:
+            # Ensure actor_id from filters is lowercase for consistency
+            filters["actor_id"] = str(filters["actor_id"]).lower()
+            logger.info(f"MemoryGraph.add: Standardized actor_id to lowercase: {filters['actor_id']}")
+
+        entity_type_map = self._retrieve_nodes_from_data(data, filters) # Pass full filters
+        to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map) # Pass full filters
+        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters) # Pass full filters
+        to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters) # Pass full filters
+
+        # _delete_entities might also need actor_id if deletions become actor-specific
+        # For now, it seems to operate on user_id based on its current signature.
+        # If actor-specific deletion is needed, its signature and logic would change.
+        deleted_entities = self._delete_entities(to_be_deleted, filters) # Pass full filters now
+
+        # Pass the full filters dictionary to _add_entities
+        added_entities = self._add_entities(to_be_added, filters, entity_type_map)
 
         return {"deleted_entities": deleted_entities, "added_entities": added_entities}
 
@@ -155,11 +172,15 @@ class MemoryGraph:
         _tools = [EXTRACT_ENTITIES_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
+
+        # Use actor_id for self-reference if available, otherwise fall back to user_id
+        self_reference_id = filters.get("actor_id") or filters.get("user_id") or "user"
+
         search_results = self.llm.generate_response(
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
+                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {self_reference_id} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
                 },
                 {"role": "user", "content": data},
             ],
@@ -185,11 +206,15 @@ class MemoryGraph:
 
     def _establish_nodes_relations_from_data(self, data, filters, entity_type_map):
         """Eshtablish relations among the extracted nodes."""
+
+        # Use actor_id for context in prompt if available, otherwise fall back to user_id
+        context_id_for_prompt = filters.get("actor_id") or filters.get("user_id") or "user"
+
         if self.config.graph_store.custom_prompt:
             messages = [
                 {
                     "role": "system",
-                    "content": EXTRACT_RELATIONS_PROMPT.replace("USER_ID", filters["user_id"]).replace(
+                    "content": EXTRACT_RELATIONS_PROMPT.replace("USER_ID", context_id_for_prompt).replace(
                         "CUSTOM_PROMPT", f"4. {self.config.graph_store.custom_prompt}"
                     ),
                 },
@@ -199,7 +224,7 @@ class MemoryGraph:
             messages = [
                 {
                     "role": "system",
-                    "content": EXTRACT_RELATIONS_PROMPT.replace("USER_ID", filters["user_id"]),
+                    "content": EXTRACT_RELATIONS_PROMPT.replace("USER_ID", context_id_for_prompt),
                 },
                 {"role": "user", "content": f"List of entities: {list(entity_type_map.keys())}. \n\nText: {data}"},
             ]
@@ -224,42 +249,86 @@ class MemoryGraph:
     def _search_graph_db(self, node_list, filters, limit=100):
         """Search similar nodes among and their respective incoming and outgoing relations."""
         result_relations = []
+        user_id = filters["user_id"]
+        actor_id = filters.get("actor_id", user_id)
 
         for node in node_list:
             n_embedding = self.embedding_model.embed(node)
 
             cypher_query = """
             MATCH (n)
-            WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
-            WITH n, round(2 * vector.similarity.cosine(n.embedding, $n_embedding) - 1, 4) AS similarity // denormalize for backward compatibility
+            WHERE n.embedding IS NOT NULL
+              AND n.user_id = $user_id
+              AND (n.actor_id = $actor_id OR n.actor_id IS NULL)
+            WITH n, round(2 * vector.similarity.cosine(n.embedding, $n_embedding) - 1, 4) AS similarity
             WHERE similarity >= $threshold
-            CALL (n) {
-                MATCH (n)-[r]->(m) 
-                RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id
+            CALL {
+                WITH n, similarity
+                MATCH (n)-[r]->(m)
+                WHERE (m.user_id = $user_id AND (m.actor_id = $actor_id OR m.actor_id IS NULL))
+                RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id, similarity AS current_similarity, elementId(n) AS n_elementId, n.actor_id AS n_actor_id
                 UNION
-                MATCH (m)-[r]->(n) 
-                RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id
+                WITH n, similarity
+                MATCH (m)-[r]->(n)
+                WHERE (m.user_id = $user_id AND (m.actor_id = $actor_id OR m.actor_id IS NULL))
+                RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id, similarity AS current_similarity, elementId(n) AS n_elementId, n.actor_id AS n_actor_id
             }
-            WITH distinct source, source_id, relationship, relation_id, destination, destination_id, similarity //deduplicate
-            RETURN source, source_id, relationship, relation_id, destination, destination_id, similarity
-            ORDER BY similarity DESC
+            RETURN distinct source, source_id, relationship, relation_id, destination, destination_id, current_similarity, n_elementId, n_actor_id
+            ORDER BY current_similarity DESC,
+                     CASE WHEN source_id = n_elementId AND n_actor_id = $actor_id THEN 0 ELSE 1 END,
+                     CASE WHEN destination_id = n_elementId AND n_actor_id = $actor_id THEN 0 ELSE 1 END
             LIMIT $limit
             """
             params = {
                 "n_embedding": n_embedding,
                 "threshold": self.threshold,
-                "user_id": filters["user_id"],
+                "user_id": user_id,
+                "actor_id": actor_id,
                 "limit": limit,
             }
-            ans = self.graph.query(cypher_query, params=params)
-            result_relations.extend(ans)
 
+            try:
+                relations = self.graph.query(cypher_query, params=params)
+                logging.info(f"relations for {actor_id}: {relations}")
+                if relations:
+                    for rel in relations:
+                        # Ensure all required keys are present before adding
+                        if all(k in rel for k in ["source", "relationship", "destination", "current_similarity"]):
+                            result_relations.append({
+                                "source": rel["source"],
+                                "relationship": rel["relationship"],
+                                "destination": rel["destination"],
+                                "similarity": rel["current_similarity"]
+                            })
+                        else:
+                            logger.warning(f"Skipping relation due to missing keys: {rel}")
+            except Exception as e:
+                logger.error(f"Error executing graph search query for node '{node}': {e}")
+
+        # Deduplicate final results if needed, though DISTINCT in Cypher helps
+        # final_results = [dict(t) for t in {tuple(d.items()) for d in result_relations}]
+        # Sort final result_relations by similarity one last time, as they are aggregated from multiple node searches
+        # However, the primary sorting happens within Cypher per queried node.
+        # If a global re-sort is needed: result_relations.sort(key=lambda x: x.get('similarity', 0), reverse=True)
         return result_relations
 
     def _get_delete_entities_from_search_output(self, search_output, data, filters):
         """Get the entities to be deleted from the search output."""
         search_output_string = format_entities(search_output)
-        system_prompt, user_prompt = get_delete_messages(search_output_string, data, filters["user_id"])
+
+        # Use actor_id for self-reference in deletion context, fallback to user_id
+        self_reference_id_for_delete = filters.get("actor_id") or filters.get("user_id") or "user"
+
+        system_prompt, user_prompt = get_delete_messages(search_output_string, data, self_reference_id_for_delete)
+
+        # ---- BEGIN ADDED LOGGING ----
+        logger.info(f"[_get_delete_entities_from_search_output] Raw search_output: {search_output}")
+        logger.info(f"[_get_delete_entities_from_search_output] Formatted existing_memories_string: '{search_output_string}'")
+        logger.info(f"[_get_delete_entities_from_search_output] New information (data): '{data}'")
+        logger.info(f"[_get_delete_entities_from_search_output] Self-reference ID for delete: '{self_reference_id_for_delete}'")
+        logger.info(f"[_get_delete_entities_from_search_output] System prompt for LLM: {system_prompt}")
+        logger.info(f"[_get_delete_entities_from_search_output] User prompt for LLM: {user_prompt}")
+        # ---- END ADDED LOGGING ----
 
         _tools = [DELETE_MEMORY_TOOL_GRAPH]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
@@ -275,6 +344,8 @@ class MemoryGraph:
             tools=_tools,
         )
 
+        logging.info(f"memory_updates: {memory_updates}")
+
         to_be_deleted = []
         for item in memory_updates["tool_calls"]:
             if item["name"] == "delete_graph_memory":
@@ -284,37 +355,59 @@ class MemoryGraph:
         logger.debug(f"Deleted relationships: {to_be_deleted}")
         return to_be_deleted
 
-    def _delete_entities(self, to_be_deleted, user_id):
-        """Delete the entities from the graph."""
+    def _delete_entities(self, to_be_deleted, filters):
+        """Delete the entities from the graph, considering user_id and actor_id."""
+        logging.info(f"to_be_deleted: {to_be_deleted} -- {filters}")
         results = []
+        user_id = filters["user_id"]
+        actor_id = filters.get("actor_id", user_id) # Default actor_id to user_id if not present
+
         for item in to_be_deleted:
             source = item["source"]
             destination = item["destination"]
             relationship = item["relationship"]
 
-            # Delete the specific relationship between nodes
+            # Delete the specific relationship between nodes, now actor_id aware
             cypher = f"""
-            MATCH (n {{name: $source_name, user_id: $user_id}})
+            MATCH (n {{name: $source_name, user_id: $user_id, actor_id: $actor_id}})
             -[r:{relationship}]->
-            (m {{name: $dest_name, user_id: $user_id}})
+            (m {{name: $dest_name, user_id: $user_id, actor_id: $actor_id}})
             DELETE r
-            RETURN 
+            RETURN
                 n.name AS source,
                 m.name AS target,
-                type(r) AS relationship
+                type(r) AS relationship // Note: type(r) will be null after DELETE r, consider returning properties before delete or just a success status
             """
+            # Alternative: To see details of what was deleted, one might capture them before DELETE
+            # For example:
+            # MATCH (n {...})-[r:{relationship}]->(m {...})
+            # WITH n, r, m, type(r) as rel_type_before_delete
+            # DELETE r
+            # RETURN n.name AS source, m.name AS target, rel_type_before_delete AS relationship
+
             params = {
                 "source_name": source,
                 "dest_name": destination,
                 "user_id": user_id,
+                "actor_id": actor_id,
             }
-            result = self.graph.query(cypher, params=params)
-            results.append(result)
+            try:
+                result = self.graph.query(cypher, params=params)
+                logging.info(f"Deleted relationship: {result}")
+                # The result of a DELETE query might be empty or summary.
+                # If specific confirmation of deleted items is needed, the query structure would change.
+                # For now, we append the raw result, assuming it indicates success if no error.
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error deleting relationship {source}-{relationship}-{destination} for actor {actor_id}: {e}")
         return results
 
-    def _add_entities(self, to_be_added, user_id, entity_type_map):
+    def _add_entities(self, to_be_added, filters, entity_type_map):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
         results = []
+        user_id = filters["user_id"] # Extract user_id from filters
+        actor_id = filters.get("actor_id", user_id) # Extract actor_id, default to user_id if not present
+
         for item in to_be_added:
             # entities
             source = item["source"]
@@ -330,8 +423,9 @@ class MemoryGraph:
             dest_embedding = self.embedding_model.embed(destination)
 
             # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(source_embedding, user_id, threshold=0.9)
-            destination_node_search_result = self._search_destination_node(dest_embedding, user_id, threshold=0.9)
+            # Pass user_id and potentially actor_id if search needs to be actor-aware
+            source_node_search_result = self._search_source_node(source_embedding, user_id, actor_id, threshold=0.9)
+            destination_node_search_result = self._search_destination_node(dest_embedding, user_id, actor_id, threshold=0.9)
 
             # TODO: Create a cypher query and common params for all the cases
             if not destination_node_search_result and source_node_search_result:
@@ -340,7 +434,7 @@ class MemoryGraph:
                     WHERE elementId(source) = $source_id
                     SET source.mentions = coalesce(source.mentions, 0) + 1
                     WITH source
-                    MERGE (destination:{destination_type} {{name: $destination_name, user_id: $user_id}})
+                    MERGE (destination:{destination_type} {{name: $destination_name, user_id: $user_id, actor_id: $actor_id}})
                     ON CREATE SET
                         destination.created = timestamp(),
                         destination.mentions = 1
@@ -350,7 +444,7 @@ class MemoryGraph:
                     CALL db.create.setNodeVectorProperty(destination, 'embedding', $destination_embedding)
                     WITH source, destination
                     MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
+                    ON CREATE SET
                         r.created = timestamp(),
                         r.mentions = 1
                     ON MATCH SET
@@ -363,6 +457,7 @@ class MemoryGraph:
                     "destination_name": destination,
                     "destination_embedding": dest_embedding,
                     "user_id": user_id,
+                    "actor_id": actor_id,
                 }
             elif destination_node_search_result and not source_node_search_result:
                 cypher = f"""
@@ -370,7 +465,7 @@ class MemoryGraph:
                     WHERE elementId(destination) = $destination_id
                     SET destination.mentions = coalesce(destination.mentions, 0) + 1
                     WITH destination
-                    MERGE (source:{source_type} {{name: $source_name, user_id: $user_id}})
+                    MERGE (source:{source_type} {{name: $source_name, user_id: $user_id, actor_id: $actor_id}})
                     ON CREATE SET
                         source.created = timestamp(),
                         source.mentions = 1
@@ -380,7 +475,7 @@ class MemoryGraph:
                     CALL db.create.setNodeVectorProperty(source, 'embedding', $source_embedding)
                     WITH source, destination
                     MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
+                    ON CREATE SET
                         r.created = timestamp(),
                         r.mentions = 1
                     ON MATCH SET
@@ -393,8 +488,13 @@ class MemoryGraph:
                     "source_name": source,
                     "source_embedding": source_embedding,
                     "user_id": user_id,
+                    "actor_id": actor_id,
                 }
             elif source_node_search_result and destination_node_search_result:
+                # Existing nodes are matched by elementId, user_id and actor_id might not need to be in MATCH
+                # but good to have in params for consistency if queries evolve.
+                # If we update actor_id on existing nodes, that's a different logic.
+                # For now, we assume actor_id is primarily for new node creation.
                 cypher = f"""
                     MATCH (source)
                     WHERE elementId(source) = $source_id
@@ -404,35 +504,38 @@ class MemoryGraph:
                     WHERE elementId(destination) = $destination_id
                     SET destination.mentions = coalesce(destination.mentions) + 1
                     MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
+                    ON CREATE SET
                         r.created_at = timestamp(),
                         r.updated_at = timestamp(),
                         r.mentions = 1
                     ON MATCH SET r.mentions = coalesce(r.mentions, 0) + 1
-                    
-                    
+
+
                     RETURN source.name AS source, type(r) AS relationship, destination.name AS target
                     """
                 params = {
                     "source_id": source_node_search_result[0]["elementId(source_candidate)"],
                     "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
-                    "user_id": user_id,
+                    "user_id": user_id, # Still useful for context, though not in MATCH elementId
+                    "actor_id": actor_id, # Same as user_id
                 }
-            else:
+            else: # Both source and destination are new or not found via embedding search with sufficient similarity
                 cypher = f"""
-                    MERGE (n:{source_type} {{name: $source_name, user_id: $user_id}})
+                    MERGE (n:{source_type} {{name: $source_name, user_id: $user_id, actor_id: $actor_id}})
                     ON CREATE SET n.created = timestamp(),
                                   n.mentions = 1
                     ON MATCH SET n.mentions = coalesce(n.mentions, 0) + 1
+                                 // Potentially update actor_id if node exists but actor is different? Or create new node for new actor?
+                                 // For now, MERGE on name, user_id, actor_id ensures distinct nodes per actor for same name.
                     WITH n
                     CALL db.create.setNodeVectorProperty(n, 'embedding', $source_embedding)
                     WITH n
-                    MERGE (m:{destination_type} {{name: $dest_name, user_id: $user_id}})
+                    MERGE (m:{destination_type} {{name: $dest_name, user_id: $user_id, actor_id: $actor_id}})
                     ON CREATE SET m.created = timestamp(),
                                   m.mentions = 1
                     ON MATCH SET m.mentions = coalesce(m.mentions, 0) + 1
                     WITH n, m
-                    CALL db.create.setNodeVectorProperty(m, 'embedding', $source_embedding)
+                    CALL db.create.setNodeVectorProperty(m, 'embedding', $dest_embedding)
                     WITH n, m
                     MERGE (n)-[rel:{relationship}]->(m)
                     ON CREATE SET rel.created = timestamp(), rel.mentions = 1
@@ -445,6 +548,7 @@ class MemoryGraph:
                     "source_embedding": source_embedding,
                     "dest_embedding": dest_embedding,
                     "user_id": user_id,
+                    "actor_id": actor_id,
                 }
             result = self.graph.query(cypher, params=params)
             results.append(result)
@@ -457,18 +561,18 @@ class MemoryGraph:
             item["destination"] = item["destination"].lower().replace(" ", "_")
         return entity_list
 
-    def _search_source_node(self, source_embedding, user_id, threshold=0.9):
+    def _search_source_node(self, source_embedding, user_id, actor_id, threshold=0.9):
         cypher = """
             MATCH (source_candidate)
-            WHERE source_candidate.embedding IS NOT NULL 
+            WHERE source_candidate.embedding IS NOT NULL
             AND source_candidate.user_id = $user_id
-
+            AND (source_candidate.actor_id = $actor_id OR source_candidate.actor_id IS NULL) // Prefer actor-specific, or general
             WITH source_candidate,
             round(2 * vector.similarity.cosine(source_candidate.embedding, $source_embedding) - 1, 4) AS source_similarity // denormalize for backward compatibility
             WHERE source_similarity >= $threshold
 
             WITH source_candidate, source_similarity
-            ORDER BY source_similarity DESC
+            ORDER BY source_similarity DESC, CASE WHEN source_candidate.actor_id = $actor_id THEN 0 ELSE 1 END // Prioritize exact actor match
             LIMIT 1
 
             RETURN elementId(source_candidate)
@@ -477,25 +581,26 @@ class MemoryGraph:
         params = {
             "source_embedding": source_embedding,
             "user_id": user_id,
+            "actor_id": actor_id,
             "threshold": threshold,
         }
 
         result = self.graph.query(cypher, params=params)
         return result
 
-    def _search_destination_node(self, destination_embedding, user_id, threshold=0.9):
+    def _search_destination_node(self, destination_embedding, user_id, actor_id, threshold=0.9):
         cypher = """
             MATCH (destination_candidate)
-            WHERE destination_candidate.embedding IS NOT NULL 
+            WHERE destination_candidate.embedding IS NOT NULL
             AND destination_candidate.user_id = $user_id
-
+            AND (destination_candidate.actor_id = $actor_id OR destination_candidate.actor_id IS NULL) // Prefer actor-specific, or general
             WITH destination_candidate,
             round(2 * vector.similarity.cosine(destination_candidate.embedding, $destination_embedding) - 1, 4) AS destination_similarity // denormalize for backward compatibility
 
             WHERE destination_similarity >= $threshold
 
             WITH destination_candidate, destination_similarity
-            ORDER BY destination_similarity DESC
+            ORDER BY destination_similarity DESC, CASE WHEN destination_candidate.actor_id = $actor_id THEN 0 ELSE 1 END // Prioritize exact actor match
             LIMIT 1
 
             RETURN elementId(destination_candidate)
@@ -503,6 +608,7 @@ class MemoryGraph:
         params = {
             "destination_embedding": destination_embedding,
             "user_id": user_id,
+            "actor_id": actor_id,
             "threshold": threshold,
         }
 
