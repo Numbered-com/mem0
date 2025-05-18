@@ -22,9 +22,9 @@ load_dotenv()
 # POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 # POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
 
-MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://localhost:7687")
-MEMGRAPH_USERNAME = os.environ.get("MEMGRAPH_USERNAME", "memgraph")
-MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "memgraph")
+# MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://localhost:7687")
+# MEMGRAPH_USERNAME = os.environ.get("MEMGRAPH_USERNAME", "memgraph")
+# MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "memgraph")
 
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
 QDRANT_PORT = os.environ.get("QDRANT_PORT", 6333)
@@ -66,7 +66,7 @@ async def get_api_key(api_key_header: Optional[str] = Security(api_key_header_au
         )
 
 DEFAULT_CONFIG = {
-    "version": "v1.1",
+    "version": "v2",
     "vector_store": {
         "provider": "qdrant",
         "config": {
@@ -136,6 +136,7 @@ app = FastAPI(
 class Message(BaseModel):
     role: str = Field(..., description="Role of the message (user or assistant).")
     content: str = Field(..., description="Message content.")
+    name: Optional[str] = None
 
 
 class MemoryCreate(BaseModel):
@@ -143,6 +144,7 @@ class MemoryCreate(BaseModel):
     user_id: Optional[str] = None
     agent_id: Optional[str] = None
     run_id: Optional[str] = None
+    infer: Optional[bool] = None
     metadata: Optional[Dict[str, Any]] = None
 
 
