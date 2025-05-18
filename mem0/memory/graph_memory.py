@@ -22,7 +22,7 @@ from mem0.graphs.tools import (
     RELATIONS_STRUCT_TOOL,
     RELATIONS_TOOL,
 )
-from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
+from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages, DELETE_RELATIONS_SYSTEM_PROMPT
 from mem0.utils.factory import EmbedderFactory, LlmFactory
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,53 @@ class MemoryGraph:
         all_entities_with_actors = self._retrieve_nodes_from_data_batch(consolidated_text, actor_segments)
         logger.debug(f"All entities from batch: {all_entities_with_actors}")
 
+        # ---- START: Explicitly ensure speaker nodes are created ----
+        # Determine base_user_id first as it's needed for speaker node creation
+        # base_user_id = None
+        # if messages_details_list:
+        #     first_message_filters = messages_details_list[0].get('filters', {})
+        #     base_user_id = first_message_filters.get('user_id') or \
+        #                    first_message_filters.get('agent_id') or \
+        #                    first_message_filters.get('run_id') or \
+        #                    'default_batch_user'
+        # else:
+        #     base_user_id = 'default_empty_batch_user'
+        #     logger.warning("messages_details_list is empty for add_batch, cannot effectively determine base_user_id for speaker node creation.")
+
+        # actual_speakers = sorted(list(set(msg_detail['filters'].get('actor_id') for msg_detail in messages_details_list if msg_detail['filters'].get('actor_id'))))
+        # logger.info(f"Actual unique speakers found in batch messages: {actual_speakers}")
+
+        # for speaker_name in actual_speakers:
+        #     speaker_entity_details_found = False
+        #     for entity_info in all_entities_with_actors:
+        #         if entity_info.get('name') == speaker_name and entity_info.get('type') == 'person' and entity_info.get('actor_id') == speaker_name:
+        #             speaker_entity_details_found = True
+        #             break
+
+        #     if speaker_entity_details_found:
+        #         logger.info(f"Ensuring graph node exists for speaker: {speaker_name}")
+        #         speaker_embedding = self.embedding_model.embed(speaker_name)
+        #         cypher_merge_speaker = """
+        #         MERGE (p:person {name: $speaker_name, user_id: $user_id, actor_id: $actor_id})
+        #         ON CREATE SET p.created = timestamp(), p.mentions = 1, p.embedding = $embedding
+        #         ON MATCH SET p.mentions = coalesce(p.mentions, 0) + 1, p.embedding = $embedding
+        #         """
+        #         # Note: updated embedding on MATCH as well, can be debated if it should only be on CREATE
+        #         params_speaker = {
+        #             "speaker_name": speaker_name,
+        #             "user_id": base_user_id,
+        #             "actor_id": speaker_name, # Speaker's node has their own name as actor_id
+        #             "embedding": speaker_embedding
+        #         }
+        #         try:
+        #             self.graph.query(cypher_merge_speaker, params=params_speaker)
+        #             logger.info(f"Ensured/merged node for speaker: {speaker_name} with actor_id: {speaker_name} and user_id: {base_user_id}")
+        #         except Exception as e:
+        #             logger.error(f"Error ensuring/merging node for speaker {speaker_name}: {e}")
+        #     else:
+        #         logger.warning(f"Speaker {speaker_name} was in messages but not extracted as a 'person' entity with self as actor_id in all_entities_with_actors. Node for this speaker might not be created if not part of other relationships.")
+        # ---- END: Explicitly ensure speaker nodes are created ----
+
         if not all_entities_with_actors:
             logger.info("No entities extracted from batch, nothing to add to graph.")
             return {"deleted_entities": [], "added_entities": []}
@@ -151,7 +198,7 @@ class MemoryGraph:
         # 5. Search graph for existing relevant data based on extracted entities
         # all_entities_with_actors already contains actor_id for each entity.
         # _search_graph_db_batch will use this for actor-specific searches.
-        comprehensive_search_output = self._search_graph_db_batch(all_entities_with_actors, base_filters_for_search_and_delete)
+        comprehensive_search_output = self._search_graph_db_batch(all_entities_with_actors, {"user_id": base_user_id}) # Pass determined base_user_id
         logger.debug(f"Comprehensive search output for batch: {comprehensive_search_output}")
 
         # 6. Identify entities/relationships to be deleted based on new batched info
@@ -207,10 +254,10 @@ class MemoryGraph:
             deletions_for_base_user = []
             # Create a temporary filter for deletion. This is NOT ideal.
             # The LLM should ideally return actor_id per deletion.
-            unique_actors_in_batch = list(set(seg['actor_id'] for seg in actor_segments))
-            for actor_id_to_delete_for in unique_actors_in_batch:
-                actor_specific_delete_filter = base_filters_for_search_and_delete.copy()
-                actor_specific_delete_filter['actor_id'] = actor_id_to_delete_for
+            # unique_actors_in_batch = list(set(seg['actor_id'] for seg in actor_segments)) # Already have actual_speakers
+            for an_actor_id_for_delete_context in actual_speakers: # Iterate actual speakers for delete context
+                # actor_specific_delete_filter = base_filters_for_search_and_delete.copy()
+                # actor_specific_delete_filter['actor_id'] = an_actor_id_for_delete_context
                 # This is still problematic as `relationships_to_delete_batch` applies to ALL actors.
                 # We should probably call _get_delete_entities_from_search_output_batch PER ACTOR if we want fine-grained deletion.
                 # That defeats the purpose of one LLM call for deletions.
@@ -218,15 +265,15 @@ class MemoryGraph:
                 # Fallback to a simpler (but less accurate) deletion strategy for now:
                 # Pass all identified deletions to _delete_entities with a generic filter that has user_id
                 # and a primary actor_id from the batch (e.g., the first one). This is NOT robust.
-                temp_delete_filters = base_filters_for_search_and_delete.copy()
-                if unique_actors_in_batch:
-                     temp_delete_filters['actor_id'] = unique_actors_in_batch[0] # Use first actor as context for all deletions - BAD!
+                temp_delete_filters = {"user_id": base_user_id} # base_filters_for_search_and_delete.copy()
+                if actual_speakers:
+                     temp_delete_filters['actor_id'] = actual_speakers[0] # Use first actor as context for all deletions - BAD!
                 else: # Should not happen if messages_details_list is not empty
                      temp_delete_filters['actor_id'] = base_user_id
 
                 deleted_for_this_context = self._delete_entities(relationships_to_delete_batch, temp_delete_filters)
                 final_deleted_results.extend(deleted_for_this_context)
-                if relationships_to_delete_batch and unique_actors_in_batch:
+                if relationships_to_delete_batch and actual_speakers:
                     logger.warning(f"Applied all batch deletions under context of actor: {temp_delete_filters['actor_id']}. This needs refinement.")
                     break # Avoid multiple deletions of same items under different actor contexts
 
@@ -271,7 +318,7 @@ class MemoryGraph:
                 # Let's assume for now relationship involves entities from the SAME actor primarily, or the source actor dictates context.
                 # This is a simplification.
 
-                add_filters = base_filters_for_search_and_delete.copy()
+                add_filters = {"user_id": base_user_id} # base_filters_for_search_and_delete.copy()
                 add_filters['actor_id'] = source_actor_id # Use source_actor_id as the context for adding this relationship.
 
                 # _add_entities expects a list of relations, and entity_type_map_batch
@@ -595,46 +642,43 @@ class MemoryGraph:
         logging.info(f"to_be_deleted: {to_be_deleted} -- {filters}")
         results = []
         user_id = filters["user_id"]
-        actor_id = filters.get("actor_id", user_id) # Default actor_id to user_id if not present
+        # actor_id from filters is no longer used directly in the MATCH clause for deletion of specific S-R-D.
+        # Deletion is now based on source name, destination name, relationship type, and user_id.
+        # This makes it more robust if the LLM identifies a semantic deletion regardless of how actor_ids are stored on nodes.
 
         for item in to_be_deleted:
             source = item["source"]
             destination = item["destination"]
             relationship = item["relationship"]
 
-            # Delete the specific relationship between nodes, now actor_id aware
-            cypher = f"""
-            MATCH (n {{name: $source_name, user_id: $user_id, actor_id: $actor_id}})
-            -[r:{relationship}]->
-            (m {{name: $dest_name, user_id: $user_id, actor_id: $actor_id}})
-            DELETE r
-            RETURN
-                n.name AS source,
-                m.name AS target,
-                type(r) AS relationship // Note: type(r) will be null after DELETE r, consider returning properties before delete or just a success status
+            # Cypher query to find and delete the specific relationship.
+            # It captures the relationship type before deletion for logging/confirmation.
+            cypher_capture_then_delete = f"""
+            MATCH (n {{name: $source_name, user_id: $user_id}})
+            MATCH (m {{name: $dest_name, user_id: $user_id}})
+            MATCH (n)-[r_to_delete:{relationship}]->(m)
+            WITH n, m, r_to_delete, type(r_to_delete) as relationship_type
+            DELETE r_to_delete
+            RETURN n.name AS source, m.name AS target, relationship_type AS relationship
             """
-            # Alternative: To see details of what was deleted, one might capture them before DELETE
-            # For example:
-            # MATCH (n {...})-[r:{relationship}]->(m {...})
-            # WITH n, r, m, type(r) as rel_type_before_delete
-            # DELETE r
-            # RETURN n.name AS source, m.name AS target, rel_type_before_delete AS relationship
 
             params = {
                 "source_name": source,
                 "dest_name": destination,
                 "user_id": user_id,
-                "actor_id": actor_id,
             }
             try:
-                result = self.graph.query(cypher, params=params)
-                logging.info(f"Deleted relationship: {result}")
-                # The result of a DELETE query might be empty or summary.
-                # If specific confirmation of deleted items is needed, the query structure would change.
-                # For now, we append the raw result, assuming it indicates success if no error.
-                results.append(result)
+                result = self.graph.query(cypher_capture_then_delete, params=params)
+                logging.info(f"Attempted delete for {source}-{relationship}-{destination} under user_id {user_id}. Result: {result}")
+                if result: # If the query found and deleted something, result will not be empty.
+                    # result is usually a list of dicts, e.g., [{'source': 'bob', 'target': 'alice', 'relationship': 'is_friend_of'}]
+                    results.append({"source": source, "relationship": relationship, "destination": destination, "status": "deleted", "details": result})
+                else:
+                    logging.info(f"No relationship matched for deletion via _delete_entities: {source}-{relationship}-{destination} under user_id {user_id}")
+
             except Exception as e:
-                logger.error(f"Error deleting relationship {source}-{relationship}-{destination} for actor {actor_id}: {e}")
+                # Log the specific S-R-D and user_id for which deletion failed.
+                logger.error(f"Error deleting relationship {source}-{relationship}-{destination} for user_id {user_id}: {e}")
         return results
 
     def _add_entities(self, to_be_added, filters, entity_type_map):
@@ -880,15 +924,20 @@ class MemoryGraph:
         actors_string = ", ".join(actor_names_in_batch)
 
         system_prompt = (
-            f"You are a smart assistant specializing in entity extraction from conversations involving multiple actors: {actors_string}. "
-            f"The input text contains messages prefixed by the speaker\'s name (e.g., 'actor_name: message content'). "
-            f"Extract all relevant entities from the entire text. "
-            f"When an entity is a self-reference (e.g., 'I', 'me', 'my'), the entity name MUST be the speaker\'s name for that part of the text. "
-            f"For each extracted entity, you MUST identify the speaker (actor_id) who mentioned or is the subject of the entity, based on the context and prefixes. "
-            f"Your output must conform to the 'extract_entities' tool schema. If the schema has an 'actor_id' field per entity, use it. "
-            f"Otherwise, ensure the entity name itself reflects the actor for self-references. "
-            f"For example, if 'claude: I am 42' is in the text, extract an entity like ('claude', 'person', actor_id='claude') or similar. "
-            f"If another actor 'leo: Claude is a friend', extract ('claude', 'person', actor_id='leo') if the tool supports actor_id, or consider how to represent this. The key is to link entities to the speaker of that segment."
+            f"You are a smart assistant specializing in entity extraction from conversations involving multiple actors: {actors_string}.\n"
+            f"The input text contains messages prefixed by the speaker's name (e.g., 'actor_name: message content'). "
+            f"IMPORTANT: For each unique speaker (actor) in the conversation (e.g., {actors_string}), you MUST extract an entity representing that speaker. "
+            f"For example, if 'Alex', and 'Chloe' are speakers, ensure you output entities like: "
+            f"  {{'entity': 'alex', 'entity_type': 'person', 'actor_id': 'alex'}}, "
+            f"  {{'entity': 'chloe', 'entity_type': 'person', 'actor_id': 'chloe'}}. "
+            f"This is in ADDITION to other entities found in their statements. "
+            f"Then, extract all other relevant entities from the entire text. "
+            f"The 'entity' name field in your output should be the pure name of the entity (e.g., 'fido', 'alice', 'mem0', 'alex'). "
+            f"DO NOT include actor information like '(actor: name)' or similar suffixes within the 'entity' name string itself. "
+            f"When an entity is a self-reference (e.g., 'I', 'me', 'my'), the 'entity' name MUST be the speaker's name for that part of the text. "
+            f"For each extracted entity (including the speaker entities themselves), you MUST populate the separate 'actor_id' field with the speaker's name (e.g., 'claude', 'leo') who mentioned or is the primary subject of that entity in that context. The actor_id for a speaker entity should be their own name. "
+            f"Your output must conform to the 'extract_entities' tool schema, which includes an 'actor_id' field per entity. "
+            f"Example of topical entity: If 'claude: I like apples.', output: {{'entity': 'apples', 'entity_type': 'fruit', 'actor_id': 'claude'}}. "
             f"***DO NOT*** answer any questions found in the text itself; only extract entities."
         )
 
@@ -900,6 +949,9 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+
+        logger.info(f"MemoryGraph.add_batch - all_entities_with_actors: {search_results}") # DETAILED LOGGING
+
 
         entity_info_list = []
         # TODO: Robust parsing of search_results["tool_calls"]
@@ -1156,9 +1208,6 @@ class MemoryGraph:
 
         user_prompt = f"Here are the existing relevant graph memories:\n{search_output_string}\n\nNew Information (potentially from multiple actors):\n{consolidated_text}"
 
-        logger.info(f"[_get_delete_entities_from_search_output_batch] System prompt for LLM: {system_prompt}")
-        logger.info(f"[_get_delete_entities_from_search_output_batch] User prompt for LLM: {user_prompt}")
-
         _tools = [DELETE_MEMORY_TOOL_GRAPH]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [DELETE_MEMORY_STRUCT_TOOL_GRAPH]
@@ -1170,8 +1219,6 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
-
-        logging.info(f"Batched memory_updates response: {memory_updates_response}")
 
         to_be_deleted_batch = []
         try:

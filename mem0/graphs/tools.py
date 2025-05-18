@@ -134,8 +134,8 @@ EXTRACT_ENTITIES_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "entity": {"type": "string", "description": "The name or identifier of the entity."},
-                            "entity_type": {"type": "string", "description": "The type or category of the entity."},
+                            "entity": {"type": "string", "description": "The name or identifier of the entity, in english."},
+                            "entity_type": {"type": "string", "description": "The type or category of the entity, in english."},
                             "actor_id": {
                                 "type": "string",
                                 "description": "The unique identifier of the actor who mentioned or is the primary subject of this entity."
