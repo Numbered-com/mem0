@@ -3,3 +3,7 @@ uvicorn==0.34.0
 pydantic==2.10.4
 mem0ai>=0.1.48
 python-dotenv==1.0.1
+psycopg2-binary>=2.9
+google.generativeai>=0.8.5
+litellm>=1.68.1
+sentence-transformers>=4.1.0

@@ -1,0 +1,68 @@
+name: mem0-dev
+
+services:
+  mem0:
+    build:
+      context: ..  # Set context to parent directory
+      dockerfile: server/dev.Dockerfile
+    ports:
+      - "127.0.0.1:8888:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./history:/app/history      # History db location. By default, it creates a history.db file on the server folder
+      - .:/app                      # Server code. This allows to reload the app when the server code is updated
+      - ../mem0:/app/packages/mem0  # Mem0 library. This allows to reload the app when the library code is updated
+    depends_on:
+      qdrant:
+        condition: service_started # Qdrant doesn't have a simple healthcheck like pg_isready, using service_started is a common approach.
+      neo4j:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload  # Enable auto-reload
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1  # Prevents Python from writing .pyc files
+      - PYTHONUNBUFFERED=1  # Ensures Python output is sent straight to terminal
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: on-failure
+    ports:
+      - "127.0.0.1:6333:6333" # gRPC port
+      - "127.0.0.1:6334:6334" # HTTP API port
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  neo4j:
+    image: neo4j:latest
+    healthcheck:
+      test: wget http://localhost:7687 || exit 1
+      interval: 1s
+      timeout: 10s
+      retries: 20
+      start_period: 3s
+    ports:
+      - "127.0.0.1:8474:7474" # HTTP
+      - "127.0.0.1:8687:7687" # Bolt
+    volumes:
+      - neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=neo4j/GQTUpM3UnuP@H8sJjG3doVyZ8y88EoaP
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+
+volumes:
+  neo4j_data:
+  qdrant_storage:
+
+networks:
+  default:
+    external: true
+    name: ipv6
+      # driver: bridge
+      #enable_ipv6: true
+      #ipam:
+      #config:
+      #- subnet: 172.20.0.0/16
+      # - subnet: 2001:db8:2::/64

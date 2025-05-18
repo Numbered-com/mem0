@@ -3,7 +3,8 @@ import os
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -14,37 +15,66 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Load environment variables
 load_dotenv()
 
-
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "postgres")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
-POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
-
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
-NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
-NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "mem0graph")
+# POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
+# POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
+# POSTGRES_DB = os.environ.get("POSTGRES_DB", "postgres")
+# POSTGRES_USER = os.environ.get("POSTGRES_USER", "postgres")
+# POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
+# POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
 
 MEMGRAPH_URI = os.environ.get("MEMGRAPH_URI", "bolt://localhost:7687")
 MEMGRAPH_USERNAME = os.environ.get("MEMGRAPH_USERNAME", "memgraph")
-MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "mem0graph")
+MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "memgraph")
+
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
+QDRANT_PORT = os.environ.get("QDRANT_PORT", 6333)
+
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j:7687")
+NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "neo4j")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+
+# Define the expected API key from environment
+EXPECTED_API_KEY = os.environ.get("MEM0_API_KEY")
+if not EXPECTED_API_KEY:
+    logging.warning("MEM0_API_KEY environment variable not set. API key security will be effectively disabled for all routes.")
+
+MODEL_DIMS = 1024
+
+# API Key Security Setup
+API_KEY_NAME = "X-API-Key"
+
+# Set auto_error to False as get_api_key will handle missing header when EXPECTED_API_KEY is set
+api_key_header_auth = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key_header: Optional[str] = Security(api_key_header_auth)):
+    if not EXPECTED_API_KEY:
+        return None
+
+    if not api_key_header:
+        raise HTTPException(
+            status_code=403, detail=f"API key header \'{API_KEY_NAME}\' missing"
+        )
+    if api_key_header == EXPECTED_API_KEY:
+        return api_key_header
+    else:
+        raise HTTPException(
+            status_code=403, detail="Could not validate credentials"
+        )
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
-        "provider": "pgvector",
+        "provider": "qdrant",
         "config": {
-            "host": POSTGRES_HOST,
-            "port": int(POSTGRES_PORT),
-            "dbname": POSTGRES_DB,
-            "user": POSTGRES_USER,
-            "password": POSTGRES_PASSWORD,
-            "collection_name": POSTGRES_COLLECTION_NAME,
-        }
+            "collection_name": "mem0",
+            "host": QDRANT_HOST,
+            "port": QDRANT_PORT,
+            "embedding_model_dims": MODEL_DIMS
+        },
     },
     "graph_store": {
         "provider": "neo4j",
@@ -55,30 +85,51 @@ DEFAULT_CONFIG = {
         }
     },
     "llm": {
-        "provider": "openai",
+        "provider": "gemini",
         "config": {
-            "api_key": OPENAI_API_KEY,
-            "temperature": 0.2,
-            "model": "gpt-4o"
+            "api_key": GOOGLE_API_KEY,
+            "model": "gemini-2.0-flash",
+            "temperature": 0.2
         }
     },
+    # "embedder": {
+    #     "provider": "gemini",
+    #     "config": {
+    #         "api_key": GOOGLE_API_KEY,
+    #         "model": "models/gemini-embedding-exp-03-07"
+    #     }
+    # },
+    #"embedder": {
+    #    "provider": "openai",
+    #    "config": {
+    #        "api_key": OPENAI_API_KEY,
+    #        "model": "text-embedding-3-small"
+    #    }
+    #},
     "embedder": {
-        "provider": "openai",
+        "provider": "huggingface",
         "config": {
-            "api_key": OPENAI_API_KEY,
-            "model": "text-embedding-3-small"
+            "model": "Lajavaness/bilingual-document-embedding",
+            "embedding_dims": MODEL_DIMS,
+            "model_kwargs": {
+                "trust_remote_code": True
+            }
         }
     },
     "history_db_path": HISTORY_DB_PATH,
 }
 
-
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
+
+# Global API key protection:
+# The get_api_key dependency will be applied to all routes if EXPECTED_API_KEY is set.
+app_dependencies = [Depends(get_api_key)] if EXPECTED_API_KEY else []
 
 app = FastAPI(
     title="Mem0 REST APIs",
     description="A REST API for managing and searching memories for your AI Agents and Apps.",
     version="1.0.0",
+    dependencies=app_dependencies
 )
 
 
