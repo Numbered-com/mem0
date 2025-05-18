@@ -125,7 +125,7 @@ EXTRACT_ENTITIES_TOOL = {
     "type": "function",
     "function": {
         "name": "extract_entities",
-        "description": "Extract entities and their types from the text.",
+        "description": "Extract entities and their types from the text. Identify the actor_id for each entity.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -136,11 +136,15 @@ EXTRACT_ENTITIES_TOOL = {
                         "properties": {
                             "entity": {"type": "string", "description": "The name or identifier of the entity."},
                             "entity_type": {"type": "string", "description": "The type or category of the entity."},
+                            "actor_id": {
+                                "type": "string",
+                                "description": "The unique identifier of the actor who mentioned or is the primary subject of this entity."
+                            }
                         },
                         "required": ["entity", "entity_type"],
                         "additionalProperties": False,
                     },
-                    "description": "An array of entities with their types.",
+                    "description": "An array of entities with their types and associated actor_ids.",
                 }
             },
             "required": ["entities"],
@@ -282,7 +286,7 @@ EXTRACT_ENTITIES_STRUCT_TOOL = {
     "type": "function",
     "function": {
         "name": "extract_entities",
-        "description": "Extract entities and their types from the text.",
+        "description": "Extract entities and their types from the text. Identify the actor_id for each entity. For use with structured LLM providers.",
         "strict": True,
         "parameters": {
             "type": "object",
@@ -294,11 +298,15 @@ EXTRACT_ENTITIES_STRUCT_TOOL = {
                         "properties": {
                             "entity": {"type": "string", "description": "The name or identifier of the entity."},
                             "entity_type": {"type": "string", "description": "The type or category of the entity."},
+                            "actor_id": {
+                                "type": "string",
+                                "description": "The unique identifier of the actor who mentioned or is the primary subject of this entity."
+                            }
                         },
                         "required": ["entity", "entity_type"],
                         "additionalProperties": False,
                     },
-                    "description": "An array of entities with their types.",
+                    "description": "An array of entities with their types and associated actor_ids.",
                 }
             },
             "required": ["entities"],

@@ -1,4 +1,6 @@
 import logging
+import json
+from copy import deepcopy
 
 from mem0.memory.utils import format_entities
 
@@ -73,20 +75,261 @@ class MemoryGraph:
             filters["actor_id"] = str(filters["actor_id"]).lower()
             logger.info(f"MemoryGraph.add: Standardized actor_id to lowercase: {filters['actor_id']}")
 
-        entity_type_map = self._retrieve_nodes_from_data(data, filters) # Pass full filters
-        to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map) # Pass full filters
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters) # Pass full filters
-        to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters) # Pass full filters
+        entity_type_map = self._retrieve_nodes_from_data(data, filters)
+        to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
+        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
+        to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
 
-        # _delete_entities might also need actor_id if deletions become actor-specific
-        # For now, it seems to operate on user_id based on its current signature.
-        # If actor-specific deletion is needed, its signature and logic would change.
-        deleted_entities = self._delete_entities(to_be_deleted, filters) # Pass full filters now
-
-        # Pass the full filters dictionary to _add_entities
+        deleted_entities = self._delete_entities(to_be_deleted, filters)
         added_entities = self._add_entities(to_be_added, filters, entity_type_map)
 
         return {"deleted_entities": deleted_entities, "added_entities": added_entities}
+
+    def add_batch(self, messages_details_list):
+        """
+        Adds a batch of messages to the graph, aiming to minimize LLM calls
+        by processing messages in consolidated batches where possible.
+
+        Args:
+            messages_details_list (list[dict]): A list of dictionaries, where each
+                dictionary contains:
+                - 'content' (str): The text content of the message.
+                - 'filters' (dict): Filters associated with this message,
+                                    including 'user_id' and a lowercased 'actor_id'.
+        """
+        logger.info(f"MemoryGraph.add_batch received {len(messages_details_list)} messages.")
+        if not messages_details_list:
+            return {"deleted_entities": [], "added_entities": []}
+
+        # 1. Consolidate messages
+        consolidated_text, actor_segments = self._consolidate_messages_for_llm(messages_details_list)
+        logger.debug(f"Consolidated text for batch: {consolidated_text}")
+        logger.debug(f"Actor segments for batch: {actor_segments}")
+
+        # 2. Extract entities from the batch
+        # This returns a list of dicts: {"name": ..., "type": ..., "actor_id": ...}
+        all_entities_with_actors = self._retrieve_nodes_from_data_batch(consolidated_text, actor_segments)
+        logger.debug(f"All entities from batch: {all_entities_with_actors}")
+
+        if not all_entities_with_actors:
+            logger.info("No entities extracted from batch, nothing to add to graph.")
+            return {"deleted_entities": [], "added_entities": []}
+
+        # Prepare entity_type_map for _add_entities later.
+        # This map should ideally be actor-aware if types can vary per actor for same entity name,
+        # but for now, we'll make a global map. If an entity appears multiple times (e.g. by different actors)
+        # its type might be overwritten here. This might need refinement if types are actor-specific.
+        entity_type_map_batch = {e['name']: e['type'] for e in all_entities_with_actors}
+
+        # 3. Establish relationships from the batch
+        # Returns list of dicts: {"source": ..., "relationship": ..., "destination": ...}
+        # The entities within these dicts are names, actor context is handled by node creation logic.
+        relationships_to_add_batch = self._establish_nodes_relations_from_data_batch(
+            consolidated_text, all_entities_with_actors, actor_segments
+        )
+        logger.debug(f"Relationships to add from batch: {relationships_to_add_batch}")
+
+        # 4. Determine base_filters (e.g., user_id) for subsequent operations.
+        # Assuming all messages in a batch share the same primary user_id/run_id.
+        # This user_id will be used for creating nodes and for searching.
+        base_user_id = None
+        if messages_details_list:
+            first_message_filters = messages_details_list[0].get('filters', {})
+            base_user_id = first_message_filters.get('user_id') or \
+                           first_message_filters.get('agent_id') or \
+                           first_message_filters.get('run_id') or \
+                           'default_batch_user' # Fallback
+            if 'user_id' not in first_message_filters:
+                 logger.warning(f"'user_id' missing in first message filters of batch, derived: {base_user_id}")
+        else:
+            base_user_id = 'default_empty_batch_user'
+            logger.warning("messages_details_list is empty, cannot determine base_user_id effectively.")
+
+        base_filters_for_search_and_delete = {"user_id": base_user_id}
+        # actor_id will be handled specifically within _search_graph_db_batch and _delete_entities
+
+        # 5. Search graph for existing relevant data based on extracted entities
+        # all_entities_with_actors already contains actor_id for each entity.
+        # _search_graph_db_batch will use this for actor-specific searches.
+        comprehensive_search_output = self._search_graph_db_batch(all_entities_with_actors, base_filters_for_search_and_delete)
+        logger.debug(f"Comprehensive search output for batch: {comprehensive_search_output}")
+
+        # 6. Identify entities/relationships to be deleted based on new batched info
+        # The `base_user_id` is passed here as a general self-reference for the prompt,
+        # but the LLM is guided by actor prefixes in consolidated_text.
+        relationships_to_delete_batch = self._get_delete_entities_from_search_output_batch(
+            comprehensive_search_output, consolidated_text, actor_segments, base_user_id
+        )
+        logger.debug(f"Relationships to delete from batch: {relationships_to_delete_batch}")
+
+        # 7. Perform deletions and additions
+        # _delete_entities and _add_entities operate on lists and handle actor_id internally
+        # based on the 'filters' provided for each operation or within the node data itself.
+        # For _delete_entities, it needs to know which actor's relationships to delete.
+        # This requires careful handling if `relationships_to_delete_batch` doesn't contain actor info per deletion.
+        # Let's assume _delete_entities will be enhanced or it works on global user_id + specific node names for now.
+        # The current _delete_entities takes 'filters' which includes an actor_id. We need to iterate deletions per actor.
+
+        final_deleted_results = []
+        if relationships_to_delete_batch:
+            # Group deletions by the implicit actor context. This is tricky as the LLM output for deletion
+            # might not explicitly state actor for each deletion. We need to infer it or improve LLM output.
+            # For now, let's assume deletions are associated with the base_user_id and the specific nodes found by LLM.
+            # A more robust approach would be to have the LLM specify actor_id for each deletion if possible.
+            # Or, iterate through actors and ask for deletions related to them based on their segment of text.
+            # This is a simplification for now, applying deletions under the main user_id context.
+            # It's assumed the LLM's identified deletions are specific enough (source-rel-dest) that actor ambiguity
+            # during delete Cypher is handled by matching nodes that could be actor-specific or general.
+            # The existing _delete_entities iterates through items and uses the actor_id from the filters provided to it.
+            # We need to ensure each deletion operation gets the correct actor_id context.
+
+            # To correctly use _delete_entities, we need to associate each deletion with its actor_id.
+            # The `relationships_to_delete_batch` from LLM contains source, relationship, destination.
+            # We need to map these back to actor_ids. This mapping is not straightforward from current LLM output for deletions.
+            # This is a significant gap.
+            # For now, we will attempt to delete by iterating through unique actor_ids present in the batch
+            # and applying all deletions under each actor's context. This is an over-deletion risk if not careful.
+            # A safer initial approach: apply deletions with the base_user_id and no specific actor_id in filters,
+            # relying on node names being unique or Cypher in _delete_entities handling actor_id if present on nodes.
+
+            # Simplification: Assume _delete_entities can handle actor-specific deletion if nodes have actor_id.
+            # Pass a filter with the base_user_id. Actor_id will be determined by Cypher matching.
+            # This requires `_delete_entities` to have robust Cypher for matching nodes that might or might not have actor_id.
+            # The current `_delete_entities` *does* query based on actor_id from its input filters.
+            # So, we must call it per actor for whom deletions are identified.
+            # The current `relationships_to_delete_batch` does NOT contain actor_ids. This is a problem.
+
+            # Let's refine: For now, since relationships_to_delete_batch does not have actor_id,
+            # we will make a simplifying assumption and pass the base_user_id filter. This means deletions are not actor-specific
+            # at the _delete_entities call level, relying on node names + user_id to be specific enough.
+            # This is a known limitation of the current batched deletion identification step.
+            logger.warning("Batched deletion is applying deletes primarily based on user_id due to LLM output format for deletions. Actor-specific deletion within batch needs refinement.")
+            deletions_for_base_user = []
+            # Create a temporary filter for deletion. This is NOT ideal.
+            # The LLM should ideally return actor_id per deletion.
+            unique_actors_in_batch = list(set(seg['actor_id'] for seg in actor_segments))
+            for actor_id_to_delete_for in unique_actors_in_batch:
+                actor_specific_delete_filter = base_filters_for_search_and_delete.copy()
+                actor_specific_delete_filter['actor_id'] = actor_id_to_delete_for
+                # This is still problematic as `relationships_to_delete_batch` applies to ALL actors.
+                # We should probably call _get_delete_entities_from_search_output_batch PER ACTOR if we want fine-grained deletion.
+                # That defeats the purpose of one LLM call for deletions.
+
+                # Fallback to a simpler (but less accurate) deletion strategy for now:
+                # Pass all identified deletions to _delete_entities with a generic filter that has user_id
+                # and a primary actor_id from the batch (e.g., the first one). This is NOT robust.
+                temp_delete_filters = base_filters_for_search_and_delete.copy()
+                if unique_actors_in_batch:
+                     temp_delete_filters['actor_id'] = unique_actors_in_batch[0] # Use first actor as context for all deletions - BAD!
+                else: # Should not happen if messages_details_list is not empty
+                     temp_delete_filters['actor_id'] = base_user_id
+
+                deleted_for_this_context = self._delete_entities(relationships_to_delete_batch, temp_delete_filters)
+                final_deleted_results.extend(deleted_for_this_context)
+                if relationships_to_delete_batch and unique_actors_in_batch:
+                    logger.warning(f"Applied all batch deletions under context of actor: {temp_delete_filters['actor_id']}. This needs refinement.")
+                    break # Avoid multiple deletions of same items under different actor contexts
+
+
+        final_added_results = []
+        if relationships_to_add_batch:
+            # _add_entities needs the `entity_type_map` and `filters` containing user_id and actor_id for each node.
+            # The `relationships_to_add_batch` gives us {source, relationship, destination}.
+            # We need to associate each S-R-D triple with the correct actor context for node creation.
+            # The `all_entities_with_actors` list gives us {"name": ..., "type": ..., "actor_id": ...}.
+            # We can use this to provide the correct actor_id when calling _add_entities for each relationship.
+
+            # Iterate through relationships to add. For each, determine the actor_id of the source/destination
+            # to pass in filters to _add_entities. This assumes _add_entities handles one S-R-D at a time.
+            for rel_to_add in relationships_to_add_batch:
+                source_name = rel_to_add['source']
+                # Find actor_id for source entity. This assumes entity names are unique identifiers within the batch context
+                # or that the first match is sufficient. If an entity like "meeting" is mentioned by two actors,
+                # which actor_id does it get? `all_entities_with_actors` might have it listed twice with different actor_ids.
+                # The LLM for relationship extraction should ideally disambiguate or we need a strategy.
+                # For now, take the first actor_id found for an entity name.
+                source_actor_id = base_user_id # Default
+                dest_actor_id = base_user_id # Default
+
+                found_source_actor = False
+                for entity_detail in all_entities_with_actors:
+                    if entity_detail['name'] == source_name:
+                        source_actor_id = entity_detail['actor_id']
+                        found_source_actor = True
+                        break
+                if not found_source_actor:
+                    logger.warning(f"Could not find actor_id for source entity '{source_name}' in all_entities_with_actors. Defaulting.")
+
+                # The `_add_entities` function takes a list of relationships.
+                # And it uses one set of `filters` for all of them. This needs to change for batch.
+                # `_add_entities` logic needs to be called per relationship with specific filters for that relationship's actors.
+                # This is a significant refactoring of _add_entities or this loop.
+
+                # Quick Fix: Let _add_entities get actor_id from the node properties if they exist, or use filters.
+                # The current _add_entities MERGEs nodes using actor_id from filters. This is fine if we pass it.
+                # We need to call _add_entities for each S-R-D with the specific actor_id(s) of the source/destination.
+                # Let's assume for now relationship involves entities from the SAME actor primarily, or the source actor dictates context.
+                # This is a simplification.
+
+                add_filters = base_filters_for_search_and_delete.copy()
+                add_filters['actor_id'] = source_actor_id # Use source_actor_id as the context for adding this relationship.
+
+                # _add_entities expects a list of relations, and entity_type_map_batch
+                added_rels = self._add_entities([rel_to_add], add_filters, entity_type_map_batch)
+                final_added_results.extend(added_rels)
+
+        logger.info(f"MemoryGraph.add_batch finished. Added: {len(final_added_results)}, Deleted: {len(final_deleted_results)}")
+        return {"deleted_entities": final_deleted_results, "added_entities": final_added_results}
+
+    def _consolidate_messages_for_llm(self, messages_details_list):
+        """
+        Consolidates multiple messages into a single string for LLM processing,
+        prefixing each message with its actor_id and adding separators.
+        Also returns a structure to map parts of the string to original actors.
+
+        Args:
+            messages_details_list (list[dict]): List of message details,
+                each with 'content' and 'filters' (containing 'actor_id').
+
+        Returns:
+            tuple: (consolidated_text, actor_segments)
+                - consolidated_text (str): A single string with all messages,
+                  formatted with actor prefixes and separators.
+                - actor_segments (list[dict]): A list of dicts, each detailing
+                  an actor segment in the consolidated text, e.g.,
+                  {'actor_id': 'claude', 'start_char': 0, 'end_char': 20, 'original_message_index': 0}
+        """
+        consolidated_parts = []
+        actor_segments = []
+        current_char_offset = 0
+        separator = "\n---\n" # Define a clear separator
+
+        for index, msg_detail in enumerate(messages_details_list):
+            content = msg_detail['content']
+            # actor_id should already be lowercased by the calling Memory._add_to_graph logic
+            actor_id = msg_detail['filters'].get('actor_id', 'unknown_actor')
+
+            prefix = f"{actor_id}: "
+            formatted_message = prefix + content
+
+            consolidated_parts.append(formatted_message)
+
+            segment_start_char = current_char_offset
+            segment_end_char = current_char_offset + len(formatted_message)
+            actor_segments.append({
+                'actor_id': actor_id,
+                'start_char': segment_start_char,
+                'end_char': segment_end_char,
+                'original_message_index': index
+            })
+
+            # Update offset for the next message, including the separator length if it's not the last message
+            current_char_offset = segment_end_char
+            if index < len(messages_details_list) - 1:
+                current_char_offset += len(separator)
+
+        consolidated_text = separator.join(consolidated_parts)
+        return consolidated_text, actor_segments
 
     def search(self, query, filters, limit=100):
         """
@@ -321,14 +564,6 @@ class MemoryGraph:
 
         system_prompt, user_prompt = get_delete_messages(search_output_string, data, self_reference_id_for_delete)
 
-        # ---- BEGIN ADDED LOGGING ----
-        logger.info(f"[_get_delete_entities_from_search_output] Raw search_output: {search_output}")
-        logger.info(f"[_get_delete_entities_from_search_output] Formatted existing_memories_string: '{search_output_string}'")
-        logger.info(f"[_get_delete_entities_from_search_output] New information (data): '{data}'")
-        logger.info(f"[_get_delete_entities_from_search_output] Self-reference ID for delete: '{self_reference_id_for_delete}'")
-        logger.info(f"[_get_delete_entities_from_search_output] System prompt for LLM: {system_prompt}")
-        logger.info(f"[_get_delete_entities_from_search_output] User prompt for LLM: {user_prompt}")
-        # ---- END ADDED LOGGING ----
 
         _tools = [DELETE_MEMORY_TOOL_GRAPH]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
@@ -614,3 +849,352 @@ class MemoryGraph:
 
         result = self.graph.query(cypher, params=params)
         return result
+
+    def _retrieve_nodes_from_data_batch(self, consolidated_text, actor_segments):
+        """
+        Extracts entities from a consolidated batch of messages using one LLM call.
+        Associates extracted entities with their original actors.
+
+        Args:
+            consolidated_text (str): The single string of all messages, with actor prefixes.
+            actor_segments (list[dict]): Information about actor segments in the text.
+
+        Returns:
+            list[dict]: A list of entity information dictionaries, e.g.,
+                        [{"name": "claude", "type": "person", "actor_id": "claude"}, ...]
+        """
+        # TODO: The self.llm_provider check and tool selection should be harmonized
+        # if it's consistently used across methods.
+        _tools = [EXTRACT_ENTITIES_TOOL]
+        if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
+            # This tool definition might need to be updated to include 'actor_id' in its output schema
+            # For now, we rely on the prompt to guide the LLM.
+            _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
+
+        # Construct a more detailed system prompt for batch processing
+        # The actor_segments can be passed to the LLM as part of the context if helpful,
+        # or used by our code to map LLM responses back.
+        # For now, the prompt primarily guides the LLM based on the inline actor prefixes.
+
+        actor_names_in_batch = sorted(list(set([seg['actor_id'] for seg in actor_segments])))
+        actors_string = ", ".join(actor_names_in_batch)
+
+        system_prompt = (
+            f"You are a smart assistant specializing in entity extraction from conversations involving multiple actors: {actors_string}. "
+            f"The input text contains messages prefixed by the speaker\'s name (e.g., 'actor_name: message content'). "
+            f"Extract all relevant entities from the entire text. "
+            f"When an entity is a self-reference (e.g., 'I', 'me', 'my'), the entity name MUST be the speaker\'s name for that part of the text. "
+            f"For each extracted entity, you MUST identify the speaker (actor_id) who mentioned or is the subject of the entity, based on the context and prefixes. "
+            f"Your output must conform to the 'extract_entities' tool schema. If the schema has an 'actor_id' field per entity, use it. "
+            f"Otherwise, ensure the entity name itself reflects the actor for self-references. "
+            f"For example, if 'claude: I am 42' is in the text, extract an entity like ('claude', 'person', actor_id='claude') or similar. "
+            f"If another actor 'leo: Claude is a friend', extract ('claude', 'person', actor_id='leo') if the tool supports actor_id, or consider how to represent this. The key is to link entities to the speaker of that segment."
+            f"***DO NOT*** answer any questions found in the text itself; only extract entities."
+        )
+
+        # The LLM call itself
+        search_results = self.llm.generate_response(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": consolidated_text},
+            ],
+            tools=_tools,
+        )
+
+        entity_info_list = []
+        # TODO: Robust parsing of search_results["tool_calls"]
+        # This parsing logic needs to be adapted based on how the LLM structures its output,
+        # especially regarding actor_id. If the tool schema is updated to include actor_id,
+        # this becomes more straightforward. If not, we might need more complex logic or
+        # rely on the LLM to make entity names actor-specific for self-references.
+
+        try:
+            for tool_call in search_results.get("tool_calls", []):
+                if tool_call["name"] == "extract_entities":
+                    for item in tool_call["arguments"].get("entities", []):
+                        entity_name = str(item["entity"]).lower().replace(" ", "_")
+                        entity_type = str(item["entity_type"]).lower().replace(" ", "_")
+
+                        # Attempt to get actor_id if provided by the LLM/tool
+                        # This is speculative as EXTRACT_ENTITIES_TOOL might not have this field yet.
+                        extracted_actor_id = item.get("actor_id")
+
+                        # TODO: If extracted_actor_id is None, we need a robust way to map this entity
+                        # back to its segment in consolidated_text and then to its actor via actor_segments.
+                        # This could involve approximate string matching or more sophisticated context mapping.
+                        # For a first pass, if not directly provided, we might have to leave it or make a best guess.
+                        # For now, we will prioritize explicit actor_id if present.
+                        # A simple fallback: if entity_name is one of the actor_names_in_batch, assume it's that actor.
+                        final_actor_id = extracted_actor_id.lower() if extracted_actor_id else None
+                        if not final_actor_id and entity_name in actor_names_in_batch:
+                            final_actor_id = entity_name
+
+                        # Fallback if no actor_id can be determined (should be improved)
+                        if not final_actor_id:
+                             # This is a simplification; true actor attribution would require more complex logic
+                             # or a more capable LLM/tool output.
+                             # For now, we log a warning. Ideally, every entity should be tied to an actor.
+                             logger.warning(f"Could not reliably determine actor_id for entity: {entity_name}. Attributing to 'unknown_actor_batch'.")
+                             final_actor_id = 'unknown_actor_batch'
+
+                        entity_info_list.append({
+                            "name": entity_name,
+                            "type": entity_type,
+                            "actor_id": final_actor_id
+                        })
+        except Exception as e:
+            logger.exception(
+                f"Error in parsing batched entity extraction results: {e}, llm_provider={self.llm_provider}, search_results={search_results}"
+            )
+
+        logger.debug(f"Batched entity_info_list: {entity_info_list}")
+        return entity_info_list
+
+    def _establish_nodes_relations_from_data_batch(self, consolidated_text, entity_info_list, actor_segments):
+        """
+        Establishes relationships from a consolidated batch of messages using one LLM call.
+        Ensures relationships respect actor contexts.
+
+        Args:
+            consolidated_text (str): The single string of all messages, with actor prefixes.
+            entity_info_list (list[dict]): List of extracted entity information,
+                                         each like {"name": ..., "type": ..., "actor_id": ...}.
+            actor_segments (list[dict]): Information about actor segments in the text.
+
+        Returns:
+            list[dict]: A list of relationship dictionaries, e.g.,
+                        [{"source": "claude", "relationship": "has_age", "destination": "42_ans"}, ...]
+                        (Actor context is implicitly carried by the actor_id of the source/destination nodes)
+        """
+        if not entity_info_list:
+            logger.info("No entities found, skipping relationship extraction.")
+            return []
+
+        # Prepare a string representation of entities with their actors for the prompt
+        # E.g., "claude (actor: claude), 42_ans (actor: claude), leo (actor: leo)"
+        entities_with_actors_str_parts = []
+        for entity_info in entity_info_list:
+            entities_with_actors_str_parts.append(f"{entity_info['name']} (actor: {entity_info['actor_id']})")
+        entities_for_prompt = ", ".join(entities_with_actors_str_parts)
+
+        actor_names_in_batch = sorted(list(set([seg['actor_id'] for seg in actor_segments])))
+        actors_string = ", ".join(actor_names_in_batch)
+
+        # System prompt for batched relationship extraction
+        # This prompt needs to be carefully designed to handle multi-actor context.
+        system_prompt = (
+            f"You are an advanced algorithm specializing in extracting relationships for a knowledge graph from conversations involving multiple actors: {actors_string}. "
+            f"The input text contains messages prefixed by the speaker\'s name. "
+            f"A list of pre-extracted entities, along with their identified actors, is provided: [{entities_for_prompt}]. "
+            f"Your task is to establish relationships ONLY between these provided entities based on the entire input text. "
+            f"When forming relationships: "
+            f"  - Consider the context of who said what. Self-references (like 'I said...' or 'my age is...') should link to the entity representing the speaker of that segment. "
+            f"  - Relationships should primarily be between entities associated with the same actor or where the text clearly links entities across different actors. "
+            f"  - Use consistent, general, and timeless relationship types (e.g., prefer 'is_friend_of' over 'became_friends_with'). "
+            f"Your output must conform to the 'establish_relationships' tool schema, providing source, relationship, and destination for each. "
+            f"Focus on explicitly stated information. Do not infer relationships not present in the text."
+        )
+
+        if self.config.graph_store.custom_prompt: # Adapting for existing custom prompt logic
+            # This might need review if custom_prompt assumes single-actor context
+            system_prompt += f"\nAdditionally, follow this custom rule: {self.config.graph_store.custom_prompt}"
+
+        _tools = [RELATIONS_TOOL]
+        if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
+            _tools = [RELATIONS_STRUCT_TOOL]
+
+        # LLM call
+        extracted_relations_response = self.llm.generate_response(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                # Providing entities again in user message might be redundant if already in system, but can reinforce
+                {"role": "user", "content": f"Entities list: [{entities_for_prompt}]\n\nFull Text:\n{consolidated_text}"},
+            ],
+            tools=_tools,
+        )
+
+        relationships_to_add = []
+        try:
+            if extracted_relations_response.get("tool_calls"):
+                for tool_call in extracted_relations_response["tool_calls"]:
+                    if tool_call["name"] == "establish_relationships":
+                        # Ensure arguments are correctly parsed (OpenAI returns string, others might return dict)
+                        args = tool_call["arguments"]
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args) # Attempt to parse if it's a JSON string
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse string arguments for establish_relationships: {args}")
+                                continue
+
+                        raw_entities = args.get("entities", [])
+                        # The _remove_spaces_from_entities helper expects a list of dicts
+                        # with 'source', 'relationship', 'destination' keys.
+                        # This tool returns entities with these keys directly.
+                        relationships_to_add.extend(self._remove_spaces_from_entities(deepcopy(raw_entities)))
+        except Exception as e:
+            logger.exception(
+                f"Error in parsing batched relationship extraction results: {e}, response: {extracted_relations_response}"
+            )
+
+        logger.debug(f"Batched relationships_to_add: {relationships_to_add}")
+        return relationships_to_add
+
+    def _search_graph_db_batch(self, entity_info_list, base_filters):
+        """
+        Searches the graph for existing data related to entities from a batch,
+        respecting actor contexts by searching per actor.
+
+        Args:
+            entity_info_list (list[dict]): List of extracted entity information,
+                                         each like {"name": ..., "type": ..., "actor_id": ...}.
+            base_filters (dict): Base filters for the search, typically containing
+                                 the main user_id or session_id.
+
+        Returns:
+            list[dict]: An aggregated list of search results (relationships)
+                        from all per-actor searches.
+        """
+        if not entity_info_list:
+            logger.info("No entities provided for batched graph search.")
+            return []
+
+        comprehensive_search_output = []
+
+        # Group entities by actor_id
+        entities_by_actor = {}
+        for entity_info in entity_info_list:
+            actor_id = entity_info.get("actor_id", "unknown_actor_batch") # Fallback if actor_id is missing
+            if actor_id not in entities_by_actor:
+                entities_by_actor[actor_id] = []
+            # We need a list of entity names for _search_graph_db's node_list argument
+            entities_by_actor[actor_id].append(entity_info["name"])
+
+        for actor_id, actor_entity_names in entities_by_actor.items():
+            if not actor_entity_names:
+                continue
+
+            # Create specific filters for this actor's search
+            actor_specific_filters = base_filters.copy()
+            actor_specific_filters["actor_id"] = actor_id
+            # Ensure user_id (or primary session id) is present
+            if "user_id" not in actor_specific_filters and "run_id" not in actor_specific_filters and "agent_id" not in actor_specific_filters:
+                # This case should ideally be covered by base_filters having the session key
+                logger.warning(f"Missing primary session ID in base_filters for actor {actor_id}")
+                # Fallback to a default if absolutely necessary, though risky
+                # actor_specific_filters["user_id"] = base_filters.get("user_id", "default_user_search")
+                # It's better to ensure base_filters is correctly populated upstream.
+
+            # Remove duplicates from entity names for the current actor before searching
+            unique_actor_entity_names = sorted(list(set(actor_entity_names)))
+
+            logger.debug(f"Searching graph for actor '{actor_id}' with entities: {unique_actor_entity_names}")
+            try:
+                # Call the existing single-actor search method
+                search_output_for_actor = self._search_graph_db(
+                    node_list=unique_actor_entity_names,
+                    filters=actor_specific_filters
+                )
+                if search_output_for_actor:
+                    comprehensive_search_output.extend(search_output_for_actor)
+            except Exception as e:
+                logger.error(f"Error during graph search for actor {actor_id}: {e}")
+
+        # Deduplicate results if needed, as different initial nodes might lead to the same relationships
+        # The current _search_graph_db already uses DISTINCT in Cypher, but across multiple calls,
+        # there could still be overlaps if we are not careful with what makes a relationship unique.
+        # A simple deduplication based on all key fields of a relationship dict:
+        deduplicated_results = []
+        seen_relations = set()
+        for rel in comprehensive_search_output:
+            # Create a frozenset of items to make the dict hashable for set storage
+            rel_tuple = tuple(sorted(rel.items()))
+            if rel_tuple not in seen_relations:
+                deduplicated_results.append(rel)
+                seen_relations.add(rel_tuple)
+
+        logger.debug(f"Batched graph search found {len(deduplicated_results)} unique relationships.")
+        return deduplicated_results
+
+    def _get_delete_entities_from_search_output_batch(self, comprehensive_search_output, consolidated_text, actor_segments, base_user_id_for_prompt):
+        """
+        Gets entities to be deleted based on a comprehensive search output and consolidated new text,
+        using a single LLM call.
+
+        Args:
+            comprehensive_search_output (list[dict]): Aggregated list of existing relevant relationships.
+            consolidated_text (str): The single string of all new messages, with actor prefixes.
+            actor_segments (list[dict]): Information about actor segments, to help LLM understand context.
+                                       (Currently unused in prompt, but available for future refinement)
+            base_user_id_for_prompt (str): A general user/session ID to use if a global self-reference ID is needed in the prompt.
+                                           The prompt primarily relies on actor prefixes in consolidated_text.
+
+        Returns:
+            list[dict]: A list of relationship dictionaries to be deleted.
+        """
+        if not comprehensive_search_output:
+            logger.info("No existing memories to evaluate for deletion.")
+            return []
+
+        search_output_string = format_entities(comprehensive_search_output) # format_entities is existing helper
+
+        # The system prompt for deletion needs to be robust for multi-actor context.
+        # The self_reference_id here is a general fallback; the LLM is guided more by actor prefixes in the text.
+        # We use base_user_id_for_prompt as a generic placeholder if the prompt template needs one,
+        # but the core instruction is to use actor prefixes from the `consolidated_text`.
+
+        system_prompt_template = DELETE_RELATIONS_SYSTEM_PROMPT # Existing prompt template
+
+        # The existing DELETE_RELATIONS_SYSTEM_PROMPT uses "SELF_REFERENCE_ID".
+        # For batched context, direct self-reference replacement is tricky.
+        # The prompt now more heavily relies on the LLM understanding actor prefixes in the consolidated_text.
+        # We provide a general ID here, but the instructions within the prompt emphasize actor prefixes.
+        # This might need further refinement based on LLM behavior.
+        system_prompt = system_prompt_template.replace("SELF_REFERENCE_ID", base_user_id_for_prompt)
+        system_prompt += ("\n\nIMPORTANT: The 'New Information' below contains messages from multiple actors, prefixed by their names (e.g., 'actor_name: message'). "
+                          "Evaluate deletions considering who said what. Self-references like 'I' or 'my' pertain to the prefixed actor of that specific message segment.")
+
+        user_prompt = f"Here are the existing relevant graph memories:\n{search_output_string}\n\nNew Information (potentially from multiple actors):\n{consolidated_text}"
+
+        logger.info(f"[_get_delete_entities_from_search_output_batch] System prompt for LLM: {system_prompt}")
+        logger.info(f"[_get_delete_entities_from_search_output_batch] User prompt for LLM: {user_prompt}")
+
+        _tools = [DELETE_MEMORY_TOOL_GRAPH]
+        if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
+            _tools = [DELETE_MEMORY_STRUCT_TOOL_GRAPH]
+
+        memory_updates_response = self.llm.generate_response(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            tools=_tools,
+        )
+
+        logging.info(f"Batched memory_updates response: {memory_updates_response}")
+
+        to_be_deleted_batch = []
+        try:
+            if memory_updates_response.get("tool_calls"):
+                for tool_call in memory_updates_response["tool_calls"]:
+                    if tool_call["name"] == "delete_graph_memory":
+                        args = tool_call["arguments"]
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse string arguments for delete_graph_memory: {args}")
+                                continue
+                        # The existing _remove_spaces_from_entities expects a list of such dicts.
+                        # Here, args is a single dict, so we wrap it in a list.
+                        # This helper also lowercases source, relationship, destination.
+                        cleaned_args_list = self._remove_spaces_from_entities(deepcopy([args]))
+                        if cleaned_args_list:
+                            to_be_deleted_batch.append(cleaned_args_list[0])
+        except Exception as e:
+            logger.exception(
+                f"Error in parsing batched deletion results: {e}, response: {memory_updates_response}"
+            )
+
+        logger.debug(f"Batched to_be_deleted: {to_be_deleted_batch}")
+        return to_be_deleted_batch

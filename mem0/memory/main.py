@@ -433,50 +433,53 @@ class Memory(MemoryBase):
         return returned_memories
 
     def _add_to_graph(self, messages, filters):
-        all_added_entities = []
-        if self.enable_graph:
-            # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
-            base_user_id = filters.get("user_id")
-            if not base_user_id:
-                # Fallback if no user_id was in the initial filters. This should ideally be set earlier.
-                base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
-                filters["user_id"] = base_user_id # Ensure it's in filters for graph methods that expect it
+        if not self.enable_graph:
+            return [] # Return empty list if graph is not enabled
 
-            for message_dict in messages:
-                if not isinstance(message_dict, dict) or \
-                   message_dict.get("role") == "system" or \
-                   message_dict.get("content") is None:
-                    continue
+        # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
+        base_user_id = filters.get("user_id")
+        if not base_user_id:
+            base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
+            filters["user_id"] = base_user_id
 
-                msg_content = message_dict["content"]
+        messages_details_list = []
+        for message_dict in messages:
+            if not isinstance(message_dict, dict) or \
+               message_dict.get("role") == "system" or \
+               message_dict.get("content") is None:
+                continue
 
-                # Determine actor_id for this message
-                actor_name = message_dict.get("name")
-                current_actor_id = actor_name if actor_name else base_user_id # Use message's 'name' or fallback
+            msg_content = message_dict["content"]
+            actor_name = message_dict.get("name")
+            # current_actor_id will be lowercased by MemoryGraph.add if it's the entry point
+            # or by the logic that prepares filters for add_batch.
+            # For now, we retrieve it as is, assuming MemoryGraph.add_batch will handle filter prep if needed.
+            current_actor_id = actor_name if actor_name else base_user_id
 
-                # Create a specific filter set for this message, including the actor_id
-                message_filters = filters.copy() # Start with a copy of the general filters
-                message_filters["actor_id"] = current_actor_id
-                # Ensure user_id is still present, as graph.add might rely on it at a higher level
-                if "user_id" not in message_filters:
-                    message_filters["user_id"] = base_user_id
+            message_filters = filters.copy()
+            message_filters["actor_id"] = str(current_actor_id).lower() # Ensure lowercase actor_id for the batch
+            if "user_id" not in message_filters: # Should always be there due to above logic
+                message_filters["user_id"] = base_user_id
 
-                logging.debug(f"Adding to graph for actor_id: {current_actor_id}, user_id: {message_filters['user_id']}, content: '{msg_content[:50]}...'")
-                try:
-                    added_entities_for_message = self.graph.add(msg_content, message_filters)
-                    if added_entities_for_message: # graph.add might return None or an empty structure
-                        if isinstance(added_entities_for_message, list):
-                            all_added_entities.extend(added_entities_for_message)
-                        elif isinstance(added_entities_for_message, dict) and "added_entities" in added_entities_for_message:
-                            # Assuming the structure is {"deleted_entities": [...], "added_entities": [...]}
-                            if added_entities_for_message["added_entities"]:
-                                all_added_entities.extend(added_entities_for_message["added_entities"])
-                        # Add more robust handling if the return type of self.graph.add varies more
-                except Exception as e:
-                    logger.error(f"Error adding message to graph for actor {current_actor_id}: {e}")
-                    # Optionally, decide if you want to continue with other messages or raise
+            messages_details_list.append({
+                'content': msg_content,
+                'filters': message_filters
+            })
 
-        return all_added_entities
+        if not messages_details_list:
+            return []
+
+        try:
+            # Single call to the new batch processing method
+            graph_result = self.graph.add_batch(messages_details_list)
+            # The structure of graph_result will depend on add_batch's final implementation.
+            # For now, let's assume it returns a dict like {'added_entities': [...], 'deleted_entities': [...]}'
+            # and we are interested in 'added_entities' for the return value of _add_to_graph.
+            # This part might need adjustment later.
+            return graph_result.get("added_entities", []) if isinstance(graph_result, dict) else []
+        except Exception as e:
+            logger.error(f"Error calling MemoryGraph.add_batch: {e}")
+            return [] # Return empty list on error
 
     def get(self, memory_id):
         """
@@ -1296,50 +1299,51 @@ class AsyncMemory(MemoryBase):
         return returned_memories
 
     async def _add_to_graph(self, messages, filters):
-        all_added_entities = []
-        if self.enable_graph:
-            # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
-            base_user_id = filters.get("user_id")
-            if not base_user_id:
-                # Fallback if no user_id was in the initial filters. This should ideally be set earlier.
-                base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
-                filters["user_id"] = base_user_id # Ensure it's in filters for graph methods that expect it
+        if not self.enable_graph:
+            return [] # Return empty list if graph is not enabled
 
-            for message_dict in messages:
-                if not isinstance(message_dict, dict) or \
-                   message_dict.get("role") == "system" or \
-                   message_dict.get("content") is None:
-                    continue
+        # Ensure a base user_id is in filters, even if we primarily use actor_id from messages
+        base_user_id = filters.get("user_id")
+        if not base_user_id:
+            base_user_id = filters.get("agent_id") or filters.get("run_id") or "default_user"
+            filters["user_id"] = base_user_id
 
-                msg_content = message_dict["content"]
+        messages_details_list = []
+        for message_dict in messages:
+            if not isinstance(message_dict, dict) or \
+               message_dict.get("role") == "system" or \
+               message_dict.get("content") is None:
+                continue
 
-                # Determine actor_id for this message
-                actor_name = message_dict.get("name")
-                current_actor_id = actor_name if actor_name else base_user_id # Use message's 'name' or fallback
+            msg_content = message_dict["content"]
+            actor_name = message_dict.get("name")
+            # current_actor_id will be lowercased by MemoryGraph.add if it's the entry point
+            # or by the logic that prepares filters for add_batch.
+            # For now, we retrieve it as is, assuming MemoryGraph.add_batch will handle filter prep if needed.
+            current_actor_id = actor_name if actor_name else base_user_id
 
-                # Create a specific filter set for this message, including the actor_id
-                message_filters = filters.copy() # Start with a copy of the general filters
-                message_filters["actor_id"] = current_actor_id
-                # Ensure user_id is still present, as graph.add might rely on it at a higher level
-                if "user_id" not in message_filters:
-                    message_filters["user_id"] = base_user_id
+            message_filters = filters.copy()
+            message_filters["actor_id"] = str(current_actor_id).lower() # Ensure lowercase actor_id for the batch
+            if "user_id" not in message_filters: # Should always be there due to above logic
+                message_filters["user_id"] = base_user_id
 
-                logging.debug(f"Adding to graph for actor_id: {current_actor_id}, user_id: {message_filters['user_id']}, content: '{msg_content[:50]}...'")
-                try:
-                    added_entities_for_message = self.graph.add(msg_content, message_filters)
-                    if added_entities_for_message: # graph.add might return None or an empty structure
-                        if isinstance(added_entities_for_message, list):
-                            all_added_entities.extend(added_entities_for_message)
-                        elif isinstance(added_entities_for_message, dict) and "added_entities" in added_entities_for_message:
-                            # Assuming the structure is {"deleted_entities": [...], "added_entities": [...]}
-                            if added_entities_for_message["added_entities"]:
-                                all_added_entities.extend(added_entities_for_message["added_entities"])
-                        # Add more robust handling if the return type of self.graph.add varies more
-                except Exception as e:
-                    logger.error(f"Error adding message to graph for actor {current_actor_id}: {e}")
-                    # Optionally, decide if you want to continue with other messages or raise
+            messages_details_list.append({
+                'content': msg_content,
+                'filters': message_filters
+            })
 
-        return all_added_entities
+        if not messages_details_list:
+            return []
+
+        try:
+            # Single call to the new batch processing method via asyncio.to_thread
+            # as add_batch is currently synchronous.
+            graph_result = await asyncio.to_thread(self.graph.add_batch, messages_details_list)
+            # Adjust return value handling similar to the synchronous version.
+            return graph_result.get("added_entities", []) if isinstance(graph_result, dict) else []
+        except Exception as e:
+            logger.error(f"Error calling MemoryGraph.add_batch asynchronously: {e}")
+            return [] # Return empty list on error
 
     async def get(self, memory_id):
         """
