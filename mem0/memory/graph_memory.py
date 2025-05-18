@@ -1,6 +1,7 @@
 import logging
 import json
 from copy import deepcopy
+import time
 
 from mem0.memory.utils import format_entities
 
@@ -62,6 +63,9 @@ class MemoryGraph:
             filters (dict): A dictionary containing filters to be applied during the addition.
                             Expected to contain 'user_id' and 'actor_id'.
         """
+        start_time = time.perf_counter()
+        logger.info(f"MemoryGraph.add started at {start_time:.4f}")
+
         # Ensure required filter keys are present, or provide defaults.
         if "user_id" not in filters:
             filters["user_id"] = filters.get("agent_id") or filters.get("run_id") or "default_user"
@@ -75,14 +79,33 @@ class MemoryGraph:
             filters["actor_id"] = str(filters["actor_id"]).lower()
             logger.info(f"MemoryGraph.add: Standardized actor_id to lowercase: {filters['actor_id']}")
 
+        t0 = time.perf_counter()
         entity_type_map = self._retrieve_nodes_from_data(data, filters)
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _retrieve_nodes_from_data took {t1 - t0:.4f} seconds.")
+
         to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
+        t2 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _establish_nodes_relations_from_data took {t2 - t1:.4f} seconds.")
+
         search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
+        t3 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _search_graph_db took {t3 - t2:.4f} seconds.")
+
         to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
+        t4 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _get_delete_entities_from_search_output took {t4 - t3:.4f} seconds.")
 
         deleted_entities = self._delete_entities(to_be_deleted, filters)
-        added_entities = self._add_entities(to_be_added, filters, entity_type_map)
+        t5 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _delete_entities took {t5 - t4:.4f} seconds.")
 
+        added_entities = self._add_entities(to_be_added, filters, entity_type_map)
+        t6 = time.perf_counter()
+        logger.info(f"MemoryGraph.add - _add_entities took {t6 - t5:.4f} seconds.")
+
+        end_time = time.perf_counter()
+        logger.info(f"MemoryGraph.add finished at {end_time:.4f}, total duration {end_time - start_time:.4f} seconds.")
         return {"deleted_entities": deleted_entities, "added_entities": added_entities}
 
     def add_batch(self, messages_details_list):
@@ -97,83 +120,56 @@ class MemoryGraph:
                 - 'filters' (dict): Filters associated with this message,
                                     including 'user_id' and a lowercased 'actor_id'.
         """
-        logger.info(f"MemoryGraph.add_batch received {len(messages_details_list)} messages.")
+        overall_start_time = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch started at {overall_start_time:.4f} for {len(messages_details_list)} messages.")
+
         if not messages_details_list:
+            logger.info("MemoryGraph.add_batch: Empty messages_details_list, returning early.")
             return {"deleted_entities": [], "added_entities": []}
 
         # 1. Consolidate messages
+        t0 = time.perf_counter()
         consolidated_text, actor_segments = self._consolidate_messages_for_llm(messages_details_list)
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - _consolidate_messages_for_llm took {t1 - t0:.4f} seconds.")
         logger.debug(f"Consolidated text for batch: {consolidated_text}")
         logger.debug(f"Actor segments for batch: {actor_segments}")
 
         # 2. Extract entities from the batch
-        # This returns a list of dicts: {"name": ..., "type": ..., "actor_id": ...}
+        t2 = time.perf_counter()
         all_entities_with_actors = self._retrieve_nodes_from_data_batch(consolidated_text, actor_segments)
+        t3 = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - _retrieve_nodes_from_data_batch (LLM call) took {t3 - t2:.4f} seconds.")
         logger.debug(f"All entities from batch: {all_entities_with_actors}")
 
-        # ---- START: Explicitly ensure speaker nodes are created ----
-        # Determine base_user_id first as it's needed for speaker node creation
-        # base_user_id = None
-        # if messages_details_list:
-        #     first_message_filters = messages_details_list[0].get('filters', {})
-        #     base_user_id = first_message_filters.get('user_id') or \
-        #                    first_message_filters.get('agent_id') or \
-        #                    first_message_filters.get('run_id') or \
-        #                    'default_batch_user'
-        # else:
-        #     base_user_id = 'default_empty_batch_user'
-        #     logger.warning("messages_details_list is empty for add_batch, cannot effectively determine base_user_id for speaker node creation.")
-
-        # actual_speakers = sorted(list(set(msg_detail['filters'].get('actor_id') for msg_detail in messages_details_list if msg_detail['filters'].get('actor_id'))))
-        # logger.info(f"Actual unique speakers found in batch messages: {actual_speakers}")
-
-        # for speaker_name in actual_speakers:
-        #     speaker_entity_details_found = False
-        #     for entity_info in all_entities_with_actors:
-        #         if entity_info.get('name') == speaker_name and entity_info.get('type') == 'person' and entity_info.get('actor_id') == speaker_name:
-        #             speaker_entity_details_found = True
-        #             break
-
-        #     if speaker_entity_details_found:
-        #         logger.info(f"Ensuring graph node exists for speaker: {speaker_name}")
-        #         speaker_embedding = self.embedding_model.embed(speaker_name)
-        #         cypher_merge_speaker = """
-        #         MERGE (p:person {name: $speaker_name, user_id: $user_id, actor_id: $actor_id})
-        #         ON CREATE SET p.created = timestamp(), p.mentions = 1, p.embedding = $embedding
-        #         ON MATCH SET p.mentions = coalesce(p.mentions, 0) + 1, p.embedding = $embedding
-        #         """
-        #         # Note: updated embedding on MATCH as well, can be debated if it should only be on CREATE
-        #         params_speaker = {
-        #             "speaker_name": speaker_name,
-        #             "user_id": base_user_id,
-        #             "actor_id": speaker_name, # Speaker's node has their own name as actor_id
-        #             "embedding": speaker_embedding
-        #         }
-        #         try:
-        #             self.graph.query(cypher_merge_speaker, params=params_speaker)
-        #             logger.info(f"Ensured/merged node for speaker: {speaker_name} with actor_id: {speaker_name} and user_id: {base_user_id}")
-        #         except Exception as e:
-        #             logger.error(f"Error ensuring/merging node for speaker {speaker_name}: {e}")
-        #     else:
-        #         logger.warning(f"Speaker {speaker_name} was in messages but not extracted as a 'person' entity with self as actor_id in all_entities_with_actors. Node for this speaker might not be created if not part of other relationships.")
-        # ---- END: Explicitly ensure speaker nodes are created ----
-
         if not all_entities_with_actors:
-            logger.info("No entities extracted from batch, nothing to add to graph.")
+            logger.info("MemoryGraph.add_batch: No entities extracted from batch, nothing to add to graph.")
+            overall_end_time = time.perf_counter()
+            logger.info(f"MemoryGraph.add_batch finished (no entities) at {overall_end_time:.4f}, total duration {overall_end_time - overall_start_time:.4f} seconds.")
             return {"deleted_entities": [], "added_entities": []}
 
         # Prepare entity_type_map for _add_entities later.
-        # This map should ideally be actor-aware if types can vary per actor for same entity name,
-        # but for now, we'll make a global map. If an entity appears multiple times (e.g. by different actors)
-        # its type might be overwritten here. This might need refinement if types are actor-specific.
         entity_type_map_batch = {e['name']: e['type'] for e in all_entities_with_actors}
 
+        # <<< START: Centralized Embedding Generation >>>
+        unique_entity_names_for_embedding = sorted(list(set(e['name'] for e in all_entities_with_actors)))
+        entity_embedding_map = {}
+        embedding_start_time = time.perf_counter()
+        for entity_name in unique_entity_names_for_embedding:
+            # TODO: Consider batching embeddings if self.embedding_model.embed supports it for multiple texts
+            entity_embedding_map[entity_name] = self.embedding_model.embed(entity_name)
+        embedding_end_time = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - Centralized embedding for {len(unique_entity_names_for_embedding)} unique entities took {embedding_end_time - embedding_start_time:.4f} seconds.")
+        logger.debug(f"MemoryGraph.add_batch - entity_embedding_map keys: {list(entity_embedding_map.keys())}")
+        # <<< END: Centralized Embedding Generation >>>
+
         # 3. Establish relationships from the batch
-        # Returns list of dicts: {"source": ..., "relationship": ..., "destination": ...}
-        # The entities within these dicts are names, actor context is handled by node creation logic.
+        t4 = time.perf_counter()
         relationships_to_add_batch = self._establish_nodes_relations_from_data_batch(
             consolidated_text, all_entities_with_actors, actor_segments
         )
+        t5 = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - _establish_nodes_relations_from_data_batch (LLM call) took {t5 - t4:.4f} seconds.")
         logger.debug(f"Relationships to add from batch: {relationships_to_add_batch}")
 
         # 4. Determine base_filters (e.g., user_id) for subsequent operations.
@@ -196,17 +192,20 @@ class MemoryGraph:
         # actor_id will be handled specifically within _search_graph_db_batch and _delete_entities
 
         # 5. Search graph for existing relevant data based on extracted entities
-        # all_entities_with_actors already contains actor_id for each entity.
-        # _search_graph_db_batch will use this for actor-specific searches.
-        comprehensive_search_output = self._search_graph_db_batch(all_entities_with_actors, {"user_id": base_user_id}) # Pass determined base_user_id
+        t6 = time.perf_counter()
+        # Pass entity_embedding_map to _search_graph_db_batch
+        comprehensive_search_output = self._search_graph_db_batch(all_entities_with_actors, {"user_id": base_user_id}, entity_embedding_map)
+        t7 = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - _search_graph_db_batch took {t7 - t6:.4f} seconds.")
         logger.debug(f"Comprehensive search output for batch: {comprehensive_search_output}")
 
         # 6. Identify entities/relationships to be deleted based on new batched info
-        # The `base_user_id` is passed here as a general self-reference for the prompt,
-        # but the LLM is guided by actor prefixes in consolidated_text.
+        t8 = time.perf_counter()
         relationships_to_delete_batch = self._get_delete_entities_from_search_output_batch(
             comprehensive_search_output, consolidated_text, actor_segments, base_user_id
         )
+        t9 = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch - _get_delete_entities_from_search_output_batch (LLM call) took {t9 - t8:.4f} seconds.")
         logger.debug(f"Relationships to delete from batch: {relationships_to_delete_batch}")
 
         # 7. Perform deletions and additions
@@ -218,6 +217,7 @@ class MemoryGraph:
         # The current _delete_entities takes 'filters' which includes an actor_id. We need to iterate deletions per actor.
 
         final_deleted_results = []
+        t10 = time.perf_counter()
         if relationships_to_delete_batch:
             # Group deletions by the implicit actor context. This is tricky as the LLM output for deletion
             # might not explicitly state actor for each deletion. We need to infer it or improve LLM output.
@@ -254,6 +254,7 @@ class MemoryGraph:
             deletions_for_base_user = []
             # Create a temporary filter for deletion. This is NOT ideal.
             # The LLM should ideally return actor_id per deletion.
+            actual_speakers = sorted(list(set(msg_detail['filters'].get('actor_id') for msg_detail in messages_details_list if msg_detail['filters'].get('actor_id'))))
             # unique_actors_in_batch = list(set(seg['actor_id'] for seg in actor_segments)) # Already have actual_speakers
             for an_actor_id_for_delete_context in actual_speakers: # Iterate actual speakers for delete context
                 # actor_specific_delete_filter = base_filters_for_search_and_delete.copy()
@@ -271,14 +272,21 @@ class MemoryGraph:
                 else: # Should not happen if messages_details_list is not empty
                      temp_delete_filters['actor_id'] = base_user_id
 
+                delete_loop_start = time.perf_counter()
                 deleted_for_this_context = self._delete_entities(relationships_to_delete_batch, temp_delete_filters)
                 final_deleted_results.extend(deleted_for_this_context)
+                delete_loop_end = time.perf_counter()
+                logger.info(f"MemoryGraph.add_batch - _delete_entities loop part took {delete_loop_end - delete_loop_start:.4f} seconds for actor {temp_delete_filters.get('actor_id')}.")
                 if relationships_to_delete_batch and actual_speakers:
                     logger.warning(f"Applied all batch deletions under context of actor: {temp_delete_filters['actor_id']}. This needs refinement.")
                     break # Avoid multiple deletions of same items under different actor contexts
+        t11 = time.perf_counter()
+        if relationships_to_delete_batch: # Log only if deletions were attempted
+            logger.info(f"MemoryGraph.add_batch - _delete_entities overall took {t11 - t10:.4f} seconds.")
 
 
         final_added_results = []
+        t12 = time.perf_counter()
         if relationships_to_add_batch:
             # _add_entities needs the `entity_type_map` and `filters` containing user_id and actor_id for each node.
             # The `relationships_to_add_batch` gives us {source, relationship, destination}.
@@ -296,7 +304,7 @@ class MemoryGraph:
                 # The LLM for relationship extraction should ideally disambiguate or we need a strategy.
                 # For now, take the first actor_id found for an entity name.
                 source_actor_id = base_user_id # Default
-                dest_actor_id = base_user_id # Default
+                # dest_actor_id = base_user_id # Default # Not used for filter context currently
 
                 found_source_actor = False
                 for entity_detail in all_entities_with_actors:
@@ -305,7 +313,7 @@ class MemoryGraph:
                         found_source_actor = True
                         break
                 if not found_source_actor:
-                    logger.warning(f"Could not find actor_id for source entity '{source_name}' in all_entities_with_actors. Defaulting.")
+                    logger.warning(f"Could not find actor_id for source entity '{source_name}' in all_entities_with_actors. Defaulting to {source_actor_id}.")
 
                 # The `_add_entities` function takes a list of relationships.
                 # And it uses one set of `filters` for all of them. This needs to change for batch.
@@ -322,10 +330,18 @@ class MemoryGraph:
                 add_filters['actor_id'] = source_actor_id # Use source_actor_id as the context for adding this relationship.
 
                 # _add_entities expects a list of relations, and entity_type_map_batch
-                added_rels = self._add_entities([rel_to_add], add_filters, entity_type_map_batch)
+                add_single_rel_start = time.perf_counter()
+                # Pass entity_embedding_map to _add_entities
+                added_rels = self._add_entities([rel_to_add], add_filters, entity_type_map_batch, entity_embedding_map)
                 final_added_results.extend(added_rels)
+                add_single_rel_end = time.perf_counter()
+                logger.info(f"MemoryGraph.add_batch - _add_entities for one relationship took {add_single_rel_end - add_single_rel_start:.4f} seconds.")
+        t13 = time.perf_counter()
+        if relationships_to_add_batch: # Log only if additions were attempted
+             logger.info(f"MemoryGraph.add_batch - _add_entities loop overall took {t13 - t12:.4f} seconds.")
 
-        logger.info(f"MemoryGraph.add_batch finished. Added: {len(final_added_results)}, Deleted: {len(final_deleted_results)}")
+        overall_end_time = time.perf_counter()
+        logger.info(f"MemoryGraph.add_batch finished at {overall_end_time:.4f}, total duration {overall_end_time - overall_start_time:.4f} seconds. Added: {len(final_added_results)}, Deleted: {len(final_deleted_results)}")
         return {"deleted_entities": final_deleted_results, "added_entities": final_added_results}
 
     def _consolidate_messages_for_llm(self, messages_details_list):
@@ -393,7 +409,14 @@ class MemoryGraph:
                 - "entities": List of related graph data based on the query.
         """
         entity_type_map = self._retrieve_nodes_from_data(query, filters)
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
+        # Assuming _retrieve_nodes_from_data gives entity names, we need to embed them for _search_graph_db
+        nodes_to_search_with_embeddings = []
+        if entity_type_map:
+            for node_name in entity_type_map.keys():
+                embedding = self.embedding_model.embed(node_name) # Embed here for search context
+                nodes_to_search_with_embeddings.append((node_name, embedding))
+
+        search_output = self._search_graph_db(nodes_to_search=nodes_to_search_with_embeddings, filters=filters, limit=limit)
 
         if not search_output:
             return []
@@ -466,6 +489,7 @@ class MemoryGraph:
         # Use actor_id for self-reference if available, otherwise fall back to user_id
         self_reference_id = filters.get("actor_id") or filters.get("user_id") or "user"
 
+        t0 = time.perf_counter()
         search_results = self.llm.generate_response(
             messages=[
                 {
@@ -476,6 +500,8 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._retrieve_nodes_from_data - LLM call took {t1 - t0:.4f} seconds.")
 
         entity_type_map = {}
 
@@ -523,10 +549,13 @@ class MemoryGraph:
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [RELATIONS_STRUCT_TOOL]
 
+        t0 = time.perf_counter()
         extracted_entities = self.llm.generate_response(
             messages=messages,
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._establish_nodes_relations_from_data - LLM call took {t1 - t0:.4f} seconds.")
 
         entities = []
         if extracted_entities["tool_calls"]:
@@ -536,14 +565,19 @@ class MemoryGraph:
         logger.debug(f"Extracted entities: {entities}")
         return entities
 
-    def _search_graph_db(self, node_list, filters, limit=100):
+    def _search_graph_db(self, nodes_to_search: list[tuple[str, list[float]]], filters, limit=100):
         """Search similar nodes among and their respective incoming and outgoing relations."""
         result_relations = []
         user_id = filters["user_id"]
         actor_id = filters.get("actor_id", user_id)
 
-        for node in node_list:
-            n_embedding = self.embedding_model.embed(node)
+        overall_search_start = time.perf_counter()
+
+        for i, (node_name, n_embedding) in enumerate(nodes_to_search):
+            node_search_start = time.perf_counter()
+            # n_embedding = self.embedding_model.embed(node) # Embedding is now pre-computed
+            # embed_time = time.perf_counter()
+            # logger.info(f"MemoryGraph._search_graph_db - Embedding for node '{node_name}' took {embed_time - node_search_start:.4f} seconds.")
 
             cypher_query = """
             MATCH (n)
@@ -577,8 +611,11 @@ class MemoryGraph:
                 "limit": limit,
             }
 
+            query_start_time = time.perf_counter()
             try:
                 relations = self.graph.query(cypher_query, params=params)
+                query_end_time = time.perf_counter()
+                logger.info(f"MemoryGraph._search_graph_db - Cypher query for node '{node_name}' took {query_end_time - query_start_time:.4f} seconds.")
                 logging.info(f"relations for {actor_id}: {relations}")
                 if relations:
                     for rel in relations:
@@ -593,13 +630,19 @@ class MemoryGraph:
                         else:
                             logger.warning(f"Skipping relation due to missing keys: {rel}")
             except Exception as e:
-                logger.error(f"Error executing graph search query for node '{node}': {e}")
+                query_end_time = time.perf_counter()
+                logger.error(f"Error executing graph search query for node '{node_name}' (took {query_end_time - query_start_time:.4f}s): {e}")
+
+            node_search_end = time.perf_counter()
+            logger.info(f"MemoryGraph._search_graph_db - Processing node {i+1}/{len(nodes_to_search)} ('{node_name}') took {node_search_end - node_search_start:.4f} seconds.")
 
         # Deduplicate final results if needed, though DISTINCT in Cypher helps
         # final_results = [dict(t) for t in {tuple(d.items()) for d in result_relations}]
         # Sort final result_relations by similarity one last time, as they are aggregated from multiple node searches
         # However, the primary sorting happens within Cypher per queried node.
         # If a global re-sort is needed: result_relations.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+        overall_search_end = time.perf_counter()
+        logger.info(f"MemoryGraph._search_graph_db - Total processing for {len(nodes_to_search)} nodes took {overall_search_end - overall_search_start:.4f} seconds.")
         return result_relations
 
     def _get_delete_entities_from_search_output(self, search_output, data, filters):
@@ -618,6 +661,7 @@ class MemoryGraph:
                 DELETE_MEMORY_STRUCT_TOOL_GRAPH,
             ]
 
+        t0 = time.perf_counter()
         memory_updates = self.llm.generate_response(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -625,6 +669,8 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._get_delete_entities_from_search_output - LLM call took {t1 - t0:.4f} seconds.")
 
         logging.info(f"memory_updates: {memory_updates}")
 
@@ -646,7 +692,10 @@ class MemoryGraph:
         # Deletion is now based on source name, destination name, relationship type, and user_id.
         # This makes it more robust if the LLM identifies a semantic deletion regardless of how actor_ids are stored on nodes.
 
-        for item in to_be_deleted:
+        overall_delete_start = time.perf_counter()
+
+        for i, item in enumerate(to_be_deleted):
+            item_delete_start = time.perf_counter()
             source = item["source"]
             destination = item["destination"]
             relationship = item["relationship"]
@@ -668,7 +717,10 @@ class MemoryGraph:
                 "user_id": user_id,
             }
             try:
+                query_start_time = time.perf_counter()
                 result = self.graph.query(cypher_capture_then_delete, params=params)
+                query_end_time = time.perf_counter()
+                logger.info(f"MemoryGraph._delete_entities - Cypher delete for item {i+1} took {query_end_time - query_start_time:.4f} seconds.")
                 logging.info(f"Attempted delete for {source}-{relationship}-{destination} under user_id {user_id}. Result: {result}")
                 if result: # If the query found and deleted something, result will not be empty.
                     # result is usually a list of dicts, e.g., [{'source': 'bob', 'target': 'alice', 'relationship': 'is_friend_of'}]
@@ -677,36 +729,73 @@ class MemoryGraph:
                     logging.info(f"No relationship matched for deletion via _delete_entities: {source}-{relationship}-{destination} under user_id {user_id}")
 
             except Exception as e:
+                query_end_time = time.perf_counter()
                 # Log the specific S-R-D and user_id for which deletion failed.
-                logger.error(f"Error deleting relationship {source}-{relationship}-{destination} for user_id {user_id}: {e}")
+                logger.error(f"Error deleting relationship {source}-{relationship}-{destination} for user_id {user_id} (took {query_end_time - query_start_time:.4f}s): {e}")
+            item_delete_end = time.perf_counter()
+            logger.info(f"MemoryGraph._delete_entities - Processing delete item {i+1}/{len(to_be_deleted)} took {item_delete_end - item_delete_start:.4f} seconds.")
+
+        overall_delete_end = time.perf_counter()
+        logger.info(f"MemoryGraph._delete_entities - Total processing for {len(to_be_deleted)} items took {overall_delete_end - overall_delete_start:.4f} seconds.")
         return results
 
-    def _add_entities(self, to_be_added, filters, entity_type_map):
+    def _add_entities(self, to_be_added, filters, entity_type_map, entity_embedding_map: dict):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
         results = []
         user_id = filters["user_id"] # Extract user_id from filters
         actor_id = filters.get("actor_id", user_id) # Extract actor_id, default to user_id if not present
 
-        for item in to_be_added:
+        overall_add_start = time.perf_counter()
+
+        for i, item in enumerate(to_be_added):
+            item_add_start = time.perf_counter()
             # entities
-            source = item["source"]
-            destination = item["destination"]
+            source_name = item["source"]
+            destination_name = item["destination"]
             relationship = item["relationship"]
+            logger.info(f"MemoryGraph._add_entities - Processing item {i+1}: {source_name} -[{relationship}]-> {destination_name}")
 
             # types
-            source_type = entity_type_map.get(source, "__User__")
-            destination_type = entity_type_map.get(destination, "__User__")
+            source_type = entity_type_map.get(source_name, "__User__")
+            destination_type = entity_type_map.get(destination_name, "__User__")
 
             # embeddings
-            source_embedding = self.embedding_model.embed(source)
-            dest_embedding = self.embedding_model.embed(destination)
+            embed_log_start_time = time.perf_counter() # Start timing for fetching pre-computed embeddings
+            source_embedding = entity_embedding_map.get(source_name)
+            dest_embedding = entity_embedding_map.get(destination_name)
+            embed_log_end_time = time.perf_counter()
+
+            if source_embedding is None:
+                logger.warning(f"MemoryGraph._add_entities - Source embedding for '{source_name}' not found in pre-computed map. Embedding now.")
+                source_embedding = self.embedding_model.embed(source_name)
+                entity_embedding_map[source_name] = source_embedding # Store if re-computed
+            if dest_embedding is None:
+                logger.warning(f"MemoryGraph._add_entities - Destination embedding for '{destination_name}' not found in pre-computed map. Embedding now.")
+                dest_embedding = self.embedding_model.embed(destination_name)
+                entity_embedding_map[destination_name] = dest_embedding # Store if re-computed
+
+            # Log the actual embeddings (or their type/shape) being used
+            logger.debug(f"MemoryGraph._add_entities - Source '{source_name}' embedding type: {type(source_embedding)}, Dest '{destination_name}' embedding type: {type(dest_embedding)}")
+            if isinstance(source_embedding, list):
+                 logger.debug(f"MemoryGraph._add_entities - Source '{source_name}' embedding length: {len(source_embedding)}")
+            if isinstance(dest_embedding, list):
+                 logger.debug(f"MemoryGraph._add_entities - Dest '{destination_name}' embedding length: {len(dest_embedding)}")
+
+            logger.info(f"MemoryGraph._add_entities - Fetching/checking embeddings for item {i+1} took {embed_log_end_time - embed_log_start_time:.4f} seconds.")
 
             # search for the nodes with the closest embeddings
             # Pass user_id and potentially actor_id if search needs to be actor-aware
+            node_search_start_time = time.perf_counter()
             source_node_search_result = self._search_source_node(source_embedding, user_id, actor_id, threshold=0.9)
             destination_node_search_result = self._search_destination_node(dest_embedding, user_id, actor_id, threshold=0.9)
+            node_search_end_time = time.perf_counter()
+            logger.info(f"MemoryGraph._add_entities - Node searches for item {i+1} took {node_search_end_time - node_search_start_time:.4f} seconds.")
+            logger.info(f"MemoryGraph._add_entities - Source node search result for '{source_name}': {source_node_search_result}")
+            logger.info(f"MemoryGraph._add_entities - Destination node search result for '{destination_name}': {destination_node_search_result}")
 
             # TODO: Create a cypher query and common params for all the cases
+            cypher = "" # Initialize cypher to ensure it's always defined
+            params = {} # Initialize params
             if not destination_node_search_result and source_node_search_result:
                 cypher = f"""
                     MATCH (source)
@@ -733,7 +822,7 @@ class MemoryGraph:
 
                 params = {
                     "source_id": source_node_search_result[0]["elementId(source_candidate)"],
-                    "destination_name": destination,
+                    "destination_name": destination_name,
                     "destination_embedding": dest_embedding,
                     "user_id": user_id,
                     "actor_id": actor_id,
@@ -764,7 +853,7 @@ class MemoryGraph:
 
                 params = {
                     "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
-                    "source_name": source,
+                    "source_name": source_name,
                     "source_embedding": source_embedding,
                     "user_id": user_id,
                     "actor_id": actor_id,
@@ -822,15 +911,29 @@ class MemoryGraph:
                     RETURN n.name AS source, type(rel) AS relationship, m.name AS target
                     """
                 params = {
-                    "source_name": source,
-                    "dest_name": destination,
+                    "source_name": source_name,
+                    "dest_name": destination_name,
                     "source_embedding": source_embedding,
                     "dest_embedding": dest_embedding,
                     "user_id": user_id,
                     "actor_id": actor_id,
                 }
-            result = self.graph.query(cypher, params=params)
+            result = [] # Initialize result to avoid potential UnboundLocalError
+            query_start_time = time.perf_counter()
+            try:
+                logger.debug(f"MemoryGraph._add_entities - Executing Cypher for item {i+1}:\nQuery: {cypher}\nParams: {params}")
+                result = self.graph.query(cypher, params=params)
+            except Exception as e:
+                logger.error(f"MemoryGraph._add_entities - Error executing Cypher for item {i+1}: {e}. Cypher: {cypher}, Params: {params}")
+            query_end_time = time.perf_counter()
+            logger.info(f"MemoryGraph._add_entities - Cypher query for item {i+1} took {query_end_time - query_start_time:.4f} seconds.")
+            logger.info(f"MemoryGraph._add_entities - Cypher result for item {i+1} ('{source_name}'-'{destination_name}'): {result}")
             results.append(result)
+            item_add_end = time.perf_counter()
+            logger.info(f"MemoryGraph._add_entities - Processing add item {i+1}/{len(to_be_added)} took {item_add_end - item_add_start:.4f} seconds.")
+
+        overall_add_end = time.perf_counter()
+        logger.info(f"MemoryGraph._add_entities - Total processing for {len(to_be_added)} items took {overall_add_end - overall_add_start:.4f} seconds.")
         return results
 
     def _remove_spaces_from_entities(self, entity_list):
@@ -864,7 +967,10 @@ class MemoryGraph:
             "threshold": threshold,
         }
 
+        t0 = time.perf_counter()
         result = self.graph.query(cypher, params=params)
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._search_source_node - Cypher query took {t1 - t0:.4f} seconds.")
         return result
 
     def _search_destination_node(self, destination_embedding, user_id, actor_id, threshold=0.9):
@@ -891,7 +997,10 @@ class MemoryGraph:
             "threshold": threshold,
         }
 
+        t0 = time.perf_counter()
         result = self.graph.query(cypher, params=params)
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._search_destination_node - Cypher query took {t1 - t0:.4f} seconds.")
         return result
 
     def _retrieve_nodes_from_data_batch(self, consolidated_text, actor_segments):
@@ -942,6 +1051,7 @@ class MemoryGraph:
         )
 
         # The LLM call itself
+        t0 = time.perf_counter()
         search_results = self.llm.generate_response(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -949,6 +1059,8 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._retrieve_nodes_from_data_batch - LLM call took {t1 - t0:.4f} seconds.")
 
         logger.info(f"MemoryGraph.add_batch - all_entities_with_actors: {search_results}") # DETAILED LOGGING
 
@@ -1036,7 +1148,7 @@ class MemoryGraph:
         # This prompt needs to be carefully designed to handle multi-actor context.
         system_prompt = (
             f"You are an advanced algorithm specializing in extracting relationships for a knowledge graph from conversations involving multiple actors: {actors_string}. "
-            f"The input text contains messages prefixed by the speaker\'s name. "
+            f"The input text contains messages prefixed by the speaker's name. "
             f"A list of pre-extracted entities, along with their identified actors, is provided: [{entities_for_prompt}]. "
             f"Your task is to establish relationships ONLY between these provided entities based on the entire input text. "
             f"When forming relationships: "
@@ -1056,6 +1168,7 @@ class MemoryGraph:
             _tools = [RELATIONS_STRUCT_TOOL]
 
         # LLM call
+        t0 = time.perf_counter()
         extracted_relations_response = self.llm.generate_response(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1064,6 +1177,8 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._establish_nodes_relations_from_data_batch - LLM call took {t1 - t0:.4f} seconds.")
 
         relationships_to_add = []
         try:
@@ -1092,7 +1207,7 @@ class MemoryGraph:
         logger.debug(f"Batched relationships_to_add: {relationships_to_add}")
         return relationships_to_add
 
-    def _search_graph_db_batch(self, entity_info_list, base_filters):
+    def _search_graph_db_batch(self, entity_info_list, base_filters, entity_embedding_map):
         """
         Searches the graph for existing data related to entities from a batch,
         respecting actor contexts by searching per actor.
@@ -1102,6 +1217,7 @@ class MemoryGraph:
                                          each like {"name": ..., "type": ..., "actor_id": ...}.
             base_filters (dict): Base filters for the search, typically containing
                                  the main user_id or session_id.
+            entity_embedding_map (dict): Pre-computed embeddings for all unique entities.
 
         Returns:
             list[dict]: An aggregated list of search results (relationships)
@@ -1111,6 +1227,7 @@ class MemoryGraph:
             logger.info("No entities provided for batched graph search.")
             return []
 
+        overall_batch_search_start_time = time.perf_counter()
         comprehensive_search_output = []
 
         # Group entities by actor_id
@@ -1140,17 +1257,30 @@ class MemoryGraph:
             # Remove duplicates from entity names for the current actor before searching
             unique_actor_entity_names = sorted(list(set(actor_entity_names)))
 
-            logger.debug(f"Searching graph for actor '{actor_id}' with entities: {unique_actor_entity_names}")
+            # Prepare nodes_to_search for _search_graph_db, which now expects (name, embedding) tuples
+            nodes_to_search_for_actor = []
+            for name in unique_actor_entity_names:
+                embedding = entity_embedding_map.get(name)
+                if embedding:
+                    nodes_to_search_for_actor.append((name, embedding))
+                else:
+                    # This should ideally not happen if all_entities_with_actors was used to populate entity_embedding_map
+                    logger.warning(f"MemoryGraph._search_graph_db_batch - Embedding for entity '{name}' not found in pre-computed map. Skipping for actor '{actor_id}' search.")
+
+            logger.debug(f"Searching graph for actor '{actor_id}' with {len(nodes_to_search_for_actor)} entities.")
+            actor_search_start_time = time.perf_counter()
             try:
                 # Call the existing single-actor search method
                 search_output_for_actor = self._search_graph_db(
-                    node_list=unique_actor_entity_names,
+                    nodes_to_search=nodes_to_search_for_actor, # Pass list of (name, embedding) tuples
                     filters=actor_specific_filters
-                )
+                ) # _search_graph_db already has its own detailed timing logs
                 if search_output_for_actor:
                     comprehensive_search_output.extend(search_output_for_actor)
             except Exception as e:
                 logger.error(f"Error during graph search for actor {actor_id}: {e}")
+            actor_search_end_time = time.perf_counter()
+            logger.info(f"MemoryGraph._search_graph_db_batch - Search for actor '{actor_id}' took {actor_search_end_time - actor_search_start_time:.4f} seconds.")
 
         # Deduplicate results if needed, as different initial nodes might lead to the same relationships
         # The current _search_graph_db already uses DISTINCT in Cypher, but across multiple calls,
@@ -1165,7 +1295,8 @@ class MemoryGraph:
                 deduplicated_results.append(rel)
                 seen_relations.add(rel_tuple)
 
-        logger.debug(f"Batched graph search found {len(deduplicated_results)} unique relationships.")
+        overall_batch_search_end_time = time.perf_counter()
+        logger.info(f"MemoryGraph._search_graph_db_batch - Total processing for all actors took {overall_batch_search_end_time - overall_batch_search_start_time:.4f} seconds. Found {len(deduplicated_results)} unique relationships.")
         return deduplicated_results
 
     def _get_delete_entities_from_search_output_batch(self, comprehensive_search_output, consolidated_text, actor_segments, base_user_id_for_prompt):
@@ -1212,6 +1343,7 @@ class MemoryGraph:
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [DELETE_MEMORY_STRUCT_TOOL_GRAPH]
 
+        t0 = time.perf_counter()
         memory_updates_response = self.llm.generate_response(
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1219,6 +1351,8 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
+        t1 = time.perf_counter()
+        logger.info(f"MemoryGraph._get_delete_entities_from_search_output_batch - LLM call took {t1 - t0:.4f} seconds.")
 
         to_be_deleted_batch = []
         try:
