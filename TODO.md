@@ -1,0 +1,2 @@
+- support actor_id in search
+- post memories performance optimisation

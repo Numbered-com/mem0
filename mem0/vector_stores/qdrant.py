@@ -100,7 +100,12 @@ class Qdrant(VectorStoreBase):
             payloads (list, optional): List of payloads corresponding to vectors. Defaults to None.
             ids (list, optional): List of IDs corresponding to vectors. Defaults to None.
         """
-        logger.info(f"Inserting {len(vectors)} vectors into collection {self.collection_name}")
+        logger.info(f"Qdrant.insert - Inserting {len(vectors)} vectors into collection {self.collection_name}")
+        if payloads:
+            logger.info(f"Qdrant.insert - First payload example: {payloads[0]}")
+        else:
+            logger.info("Qdrant.insert - No payloads provided.")
+
         points = [
             PointStruct(
                 id=idx if ids is None else ids[idx],
@@ -232,7 +237,7 @@ class Qdrant(VectorStoreBase):
             with_vectors=False,
         )
         return result
-    
+
     def reset(self):
         """Reset the index by deleting and recreating it."""
         logger.warning(f"Resetting index {self.collection_name}...")

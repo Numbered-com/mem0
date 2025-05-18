@@ -709,8 +709,11 @@ class Memory(MemoryBase):
             return {"results": original_memories}
 
     def _search_vector_store(self, query, filters, limit):
+        logger.info(f"Memory._search_vector_store - Query: '{query}', Filters: {filters}, Limit: {limit}")
         embeddings = self.embedding_model.embed(query, "search")
+        logger.info(f"Memory._search_vector_store - Query embedding (first 3 dims): {embeddings[:3] if embeddings and len(embeddings) > 3 else embeddings}")
         memories = self.vector_store.search(query=query, vectors=embeddings, limit=limit, filters=filters)
+        logger.info(f"Memory._search_vector_store - Raw search result from vector_store.search: {memories}")
 
         promoted_payload_keys = [
             "user_id",
@@ -1581,10 +1584,13 @@ class AsyncMemory(MemoryBase):
             return {"results": original_memories}
 
     async def _search_vector_store(self, query, filters, limit):
+        logger.info(f"AsyncMemory._search_vector_store - Query: '{query}', Filters: {filters}, Limit: {limit}")
         embeddings = await asyncio.to_thread(self.embedding_model.embed, query, "search")
+        logger.info(f"AsyncMemory._search_vector_store - Query embedding (first 3 dims): {embeddings[:3] if embeddings and len(embeddings) > 3 else embeddings}")
         memories = await asyncio.to_thread(
             self.vector_store.search, query=query, vectors=embeddings, limit=limit, filters=filters
         )
+        logger.info(f"AsyncMemory._search_vector_store - Raw search result from vector_store.search: {memories}")
 
         promoted_payload_keys = [
             "user_id",

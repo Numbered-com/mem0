@@ -408,17 +408,28 @@ class MemoryGraph:
                 - "contexts": List of search results from the base data store.
                 - "entities": List of related graph data based on the query.
         """
+        logger.info(f"MemoryGraph.search - Received query: '{query}', filters: {filters}, limit: {limit}")
+
         entity_type_map = self._retrieve_nodes_from_data(query, filters)
+        logger.info(f"MemoryGraph.search - Extracted entity_type_map: {entity_type_map}")
+
         # Assuming _retrieve_nodes_from_data gives entity names, we need to embed them for _search_graph_db
         nodes_to_search_with_embeddings = []
         if entity_type_map:
             for node_name in entity_type_map.keys():
+                embedding_start_time = time.perf_counter()
                 embedding = self.embedding_model.embed(node_name) # Embed here for search context
+                embedding_end_time = time.perf_counter()
+                logger.info(f"MemoryGraph.search - Embedding for node_name '{node_name}' took {embedding_end_time - embedding_start_time:.4f} seconds.")
                 nodes_to_search_with_embeddings.append((node_name, embedding))
 
+        logger.info(f"MemoryGraph.search - nodes_to_search_with_embeddings: {[(n, type(e)) for n, e in nodes_to_search_with_embeddings]}") # Log type of embedding
+
         search_output = self._search_graph_db(nodes_to_search=nodes_to_search_with_embeddings, filters=filters, limit=limit)
+        logger.info(f"MemoryGraph.search - Raw search_output from _search_graph_db: {search_output}")
 
         if not search_output:
+            logger.info("MemoryGraph.search - _search_graph_db returned no results. Returning empty list.")
             return []
 
         search_outputs_sequence = [
@@ -494,7 +505,7 @@ class MemoryGraph:
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {self_reference_id} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
+                    "content": f"You are an expert entity extraction system. Your task is to identify and extract all relevant entities and their types from the given text. If the text is a question, extract entities that are key to understanding what the question is about. For example, from 'What are the key features of Product X?', entities might include 'Product X' (type: product) and 'key features' (type: concept). If the text contains self-references like 'I', 'me', 'my', use '{self_reference_id}' as the entity name for the self-reference. Adhere strictly to the 'extract_entities' tool schema.",
                 },
                 {"role": "user", "content": data},
             ],
@@ -566,48 +577,73 @@ class MemoryGraph:
         return entities
 
     def _search_graph_db(self, nodes_to_search: list[tuple[str, list[float]]], filters, limit=100):
-        """Search similar nodes among and their respective incoming and outgoing relations."""
-        result_relations = []
-        user_id = filters["user_id"]
-        actor_id = filters.get("actor_id", user_id)
+        logger.info(f"MemoryGraph._search_graph_db - Called with {len(nodes_to_search)} nodes_to_search, filters: {filters}")
 
+        if not nodes_to_search:
+            return []
+
+        # Determine the primary session identifier from filters
+        session_id_key = None
+        if "user_id" in filters:
+            session_id_key = "user_id"
+        elif "agent_id" in filters:
+            session_id_key = "agent_id"
+        elif "run_id" in filters:
+            session_id_key = "run_id"
+
+        user_id = filters.get(session_id_key) # This will be the value for user_id, agent_id, or run_id
+
+        if not user_id:
+            logger.error(f"MemoryGraph._search_graph_db - Critical: Could not determine primary session ID (user_id/agent_id/run_id) from filters: {filters}. Aborting search for this part.")
+            return [] # Or raise an error
+
+        actor_id_for_cypher_param = filters.get("actor_id")
+        logger.info(f"MemoryGraph._search_graph_db - Resolved user_id for Cypher: '{user_id}' (from key '{session_id_key}'), resolved actor_id_for_cypher_param: {actor_id_for_cypher_param}")
+
+
+        all_relations = []
         overall_search_start = time.perf_counter()
 
         for i, (node_name, n_embedding) in enumerate(nodes_to_search):
             node_search_start = time.perf_counter()
-            # n_embedding = self.embedding_model.embed(node) # Embedding is now pre-computed
-            # embed_time = time.perf_counter()
-            # logger.info(f"MemoryGraph._search_graph_db - Embedding for node '{node_name}' took {embed_time - node_search_start:.4f} seconds.")
 
+            # Cypher query now uses $actor_id_param which can be NULL
+            # If $actor_id_param IS NULL, it effectively searches across all actors for the given user_id.
+            # If $actor_id_param is provided, it filters for that specific actor.
             cypher_query = """
             MATCH (n)
             WHERE n.embedding IS NOT NULL
               AND n.user_id = $user_id
-              AND (n.actor_id = $actor_id OR n.actor_id IS NULL)
-            WITH n, round(2 * vector.similarity.cosine(n.embedding, $n_embedding) - 1, 4) AS similarity
+              AND ($actor_id_param IS NULL OR n.actor_id = $actor_id_param)
+            WITH n, round(vector.similarity.cosine(n.embedding, $n_embedding), 4) AS similarity
             WHERE similarity >= $threshold
             CALL {
                 WITH n, similarity
                 MATCH (n)-[r]->(m)
-                WHERE (m.user_id = $user_id AND (m.actor_id = $actor_id OR m.actor_id IS NULL))
+                WHERE m.user_id = $user_id AND ($actor_id_param IS NULL OR m.actor_id = $actor_id_param)
                 RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id, similarity AS current_similarity, elementId(n) AS n_elementId, n.actor_id AS n_actor_id
                 UNION
                 WITH n, similarity
                 MATCH (m)-[r]->(n)
-                WHERE (m.user_id = $user_id AND (m.actor_id = $actor_id OR m.actor_id IS NULL))
+                WHERE m.user_id = $user_id AND ($actor_id_param IS NULL OR m.actor_id = $actor_id_param)
                 RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relationship, elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id, similarity AS current_similarity, elementId(n) AS n_elementId, n.actor_id AS n_actor_id
             }
             RETURN distinct source, source_id, relationship, relation_id, destination, destination_id, current_similarity, n_elementId, n_actor_id
             ORDER BY current_similarity DESC,
-                     CASE WHEN source_id = n_elementId AND n_actor_id = $actor_id THEN 0 ELSE 1 END,
-                     CASE WHEN destination_id = n_elementId AND n_actor_id = $actor_id THEN 0 ELSE 1 END
+                     // Prioritize matches where the found node 'n' (represented by n_elementId) itself has the specific actor_id if one was provided
+                     CASE WHEN $actor_id_param IS NOT NULL AND n_actor_id = $actor_id_param THEN 0 ELSE 1 END,
+                     // Further prioritize if source/destination in relation also matches specific actor_id
+                     // Check if the matched node 'n' (identified by n_elementId) is the source of the relationship AND its actor_id matches
+                     CASE WHEN $actor_id_param IS NOT NULL AND source_id = n_elementId AND n_actor_id = $actor_id_param THEN 0 ELSE 1 END,
+                     // Check if the matched node 'n' is the destination of the relationship AND its actor_id matches
+                     CASE WHEN $actor_id_param IS NOT NULL AND destination_id = n_elementId AND n_actor_id = $actor_id_param THEN 0 ELSE 1 END
             LIMIT $limit
             """
             params = {
                 "n_embedding": n_embedding,
-                "threshold": self.threshold,
+                "threshold": self.threshold, # Make sure self.threshold is appropriate (e.g., 0.7)
                 "user_id": user_id,
-                "actor_id": actor_id,
+                "actor_id_param": actor_id_for_cypher_param, # This can be None
                 "limit": limit,
             }
 
@@ -615,13 +651,12 @@ class MemoryGraph:
             try:
                 relations = self.graph.query(cypher_query, params=params)
                 query_end_time = time.perf_counter()
-                logger.info(f"MemoryGraph._search_graph_db - Cypher query for node '{node_name}' took {query_end_time - query_start_time:.4f} seconds.")
-                logging.info(f"relations for {actor_id}: {relations}")
+                logger.info(f"MemoryGraph._search_graph_db - Cypher query for node '{node_name}' took {query_end_time - query_start_time:.4f} seconds with params: {params}")
+                logger.info(f"MemoryGraph._search_graph_db - Found {len(relations) if relations else 0} relations for node '{node_name}' (user: {user_id}, actor_param: {actor_id_for_cypher_param})")
                 if relations:
                     for rel in relations:
-                        # Ensure all required keys are present before adding
                         if all(k in rel for k in ["source", "relationship", "destination", "current_similarity"]):
-                            result_relations.append({
+                            all_relations.append({
                                 "source": rel["source"],
                                 "relationship": rel["relationship"],
                                 "destination": rel["destination"],
@@ -642,8 +677,9 @@ class MemoryGraph:
         # However, the primary sorting happens within Cypher per queried node.
         # If a global re-sort is needed: result_relations.sort(key=lambda x: x.get('similarity', 0), reverse=True)
         overall_search_end = time.perf_counter()
-        logger.info(f"MemoryGraph._search_graph_db - Total processing for {len(nodes_to_search)} nodes took {overall_search_end - overall_search_start:.4f} seconds.")
-        return result_relations
+        # logger.info(f"MemoryGraph._search_graph_db - Total processing for {len(nodes_to_search)} nodes took {overall_search_end - overall_search_start:.4f} seconds.")
+        logger.info(f"MemoryGraph._search_graph_db - Returning {len(all_relations)} relations.")
+        return all_relations
 
     def _get_delete_entities_from_search_output(self, search_output, data, filters):
         """Get the entities to be deleted from the search output."""
